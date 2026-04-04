@@ -1,0 +1,32 @@
+services:
+  dashboard-gen:
+    build: .
+    container_name: ${CONTAINER_NAME:-dashboard-gen}
+    working_dir: /app
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ}
+      HA_URL: ${HA_URL}
+      HA_TOKEN: ${HA_TOKEN}
+      WEATHER_ENTITY: ${WEATHER_ENTITY}
+      CALENDAR_ENTITY: ${CALENDAR_ENTITY}
+      TODO_ENTITY: ${TODO_ENTITY}
+      OLLAMA_URL: ${OLLAMA_URL}
+      OLLAMA_MODEL: ${OLLAMA_MODEL}
+      COMFY_URL: ${COMFY_URL}
+      EPD_PUSH_URL: ${EPD_PUSH_URL}
+      EPD_PUSH_ENABLED: ${EPD_PUSH_ENABLED:-0}
+      EPD_PUSH_FAIL_HARD: ${EPD_PUSH_FAIL_HARD:-0}
+      EPD_ROTATE_CW: ${EPD_ROTATE_CW:-270}
+      COMFY_WORKFLOW_FILE: ${COMFY_WORKFLOW_FILE:-/app/workflows/picture_api.json}
+      DEBIAN_FRONTEND: ${DEBIAN_FRONTEND:-noninteractive}
+    volumes:
+      - ./app:/app
+      - ${OUTPUT_DIR:-/opt/homepage/generated}:/out
+      - ${WORKFLOWS_DIR:-/opt/dashboard-gen/workflows}:/app/workflows:ro
+      - ${ASSETS_DIR:-/opt/dashboard-gen/assets}:/assets:ro
+      - ${FRAME_TOOLS_DIR:-/opt/frame-tools}:/frame-tools:ro
+    ports:
+      - "${HOST_PORT:-8787}:${CONTAINER_PORT:-8787}"
+    restart: unless-stopped

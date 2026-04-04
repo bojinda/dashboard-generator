@@ -1,0 +1,20 @@
+# Secrets / local config
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Local backups / editor junk
+*.bak
+*.bak2
+*.tmp
+*.swp
+.DS_Store
+
+# Generated output
+image_data.bin
+/out/

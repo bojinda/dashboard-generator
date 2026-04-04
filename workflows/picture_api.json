@@ -1,0 +1,163 @@
+{
+  "1": {
+    "inputs": {
+      "unet_name": "qwen_image_edit_2511_bf16.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "Load Diffusion Model"
+    }
+  },
+  "3": {
+    "inputs": {
+      "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+      "type": "qwen_image",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "Load CLIP"
+    }
+  },
+  "4": {
+    "inputs": {
+      "vae_name": "qwen_image_vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "Load VAE"
+    }
+  },
+  "7": {
+    "inputs": {
+      "positive_prompt": [
+        "88",
+        0
+      ],
+      "negative_prompt": "",
+      "generation_mode": "图生图 image-to-image",
+      "batch_size": 1,
+      "width": [
+        "40",
+        3
+      ],
+      "height": [
+        "40",
+        4
+      ],
+      "seed": 148299948157986,
+      "steps": 4,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "auraflow_shift": 3,
+      "cfg_norm_strength": 1,
+      "enable_clean_gpu_memory": false,
+      "enable_clean_cpu_memory_after_finish": false,
+      "enable_sound_notification": false,
+      "auto_save_output_folder": "",
+      "output_filename_prefix": "auto_save",
+      "instruction": "Describe the key features of the input image (color, shape, size, texture, objects, background), then explain how the user's text instruction should alter or modify the image. Generate a new image that meets the user's requirements while maintaining consistency with the original input where appropriate.",
+      "model": [
+        "28",
+        0
+      ],
+      "clip": [
+        "3",
+        0
+      ],
+      "vae": [
+        "4",
+        0
+      ],
+      "image1": [
+        "40",
+        0
+      ]
+    },
+    "class_type": "QwenImageIntegratedKSampler",
+    "_meta": {
+      "title": "🐋 Qwen Image Integrated KSampler - Github:﹫luguoli"
+    }
+  },
+  "9": {
+    "inputs": {
+      "image": "portrait.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "Load Image1"
+    }
+  },
+  "28": {
+    "inputs": {
+      "lora_name": "Qwen-Image-Edit-2511-Lightning-4steps-V1.0-fp32.safetensors",
+      "strength_model": 1,
+      "model": [
+        "1",
+        0
+      ]
+    },
+    "class_type": "LoraLoaderModelOnly",
+    "_meta": {
+      "title": "LoraLoaderModelOnly"
+    }
+  },
+  "35": {
+    "inputs": {
+      "value": 1536
+    },
+    "class_type": "PrimitiveInt",
+    "_meta": {
+      "title": "Output Size Limit (Long Side)"
+    }
+  },
+  "36": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Image"
+    }
+  },
+  "40": {
+    "inputs": {
+      "aspect_ratio": "custom",
+      "proportional_width": 1536,
+      "proportional_height": 768,
+      "fit": "letterbox",
+      "method": "lanczos",
+      "round_to_multiple": "8",
+      "scale_to_side": "longest",
+      "scale_to_length": [
+        "35",
+        0
+      ],
+      "background_color": "#F5F5F5",
+      "image": [
+        "9",
+        0
+      ]
+    },
+    "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+    "_meta": {
+      "title": "LayerUtility: ImageScaleByAspectRatio V2"
+    }
+  },
+  "88": {
+    "inputs": {
+      "value": "{{PROMPT}}"
+    },
+    "class_type": "PrimitiveStringMultiline",
+    "_meta": {
+      "title": "Prompt"
+    }
+  }
+}
