@@ -54,8 +54,8 @@
       "denoise": 1,
       "auraflow_shift": 3,
       "cfg_norm_strength": 1,
-      "enable_clean_gpu_memory": false,
-      "enable_clean_cpu_memory_after_finish": false,
+      "enable_clean_gpu_memory": true,
+      "enable_clean_cpu_memory_after_finish": true,
       "enable_sound_notification": false,
       "auto_save_output_folder": "",
       "output_filename_prefix": "auto_save",
@@ -125,6 +125,20 @@
     "class_type": "SaveImage",
     "_meta": {
       "title": "Save Image"
+    }
+  },
+  "94": {
+    "inputs": {
+      "purge_cache": true,
+      "purge_models": true,
+      "anything": [
+        "7",
+          0
+      ]
+    },
+    "class_type": "LayerUtility: PurgeVRAM",
+    "_meta": {
+    "title": "LayerUtility: Purge VRAM"
     }
   },
   "40": {
