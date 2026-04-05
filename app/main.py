@@ -1005,7 +1005,7 @@ def comfy_render_image(final_prompt: str, width: int, height: int, timeout_s: in
     #print(f"COMFY workflow file -> {COMFY_WORKFLOW_FILE}", flush=True)
 
     # 3) queue
-    r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=30)
+    r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=40)
     #print(f"COMFY /prompt status -> {r.status_code}", flush=True)
     #print(f"COMFY /prompt body -> {r.text[:800]}", flush=True)
 
