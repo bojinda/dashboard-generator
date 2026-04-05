@@ -1,3 +1,5 @@
+![20260326_120247_preview](https://github.com/user-attachments/assets/5c1f15a2-e0df-4eea-b57c-afd371a1cef5)
+
 # Dashboard Generator
 
 A self-hosted dashboard image generator for e-paper or wall display use.
