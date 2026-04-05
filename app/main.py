@@ -86,7 +86,7 @@ def ha_call_service(domain: str, service: str, data: dict | None = None, target:
     if target:
         payload["target"] = target
 
-    r = requests.post(url, headers=headers, json=payload, timeout=20)
+    r = requests.post(url, headers=headers, json=payload, timeout=45)
     r.raise_for_status()
     return r.json()
 
@@ -304,7 +304,7 @@ def ollama_daily_quote() -> str:
     q = ""
     try:
         for _ in range(3):
-            r = requests.post(url, json=payload, timeout=20)
+            r = requests.post(url, json=payload, timeout=45)
             r.raise_for_status()
             raw = (r.json().get("response") or "").strip().splitlines()[0].strip()
             raw = clean_quote_text(raw)
@@ -884,7 +884,7 @@ def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> st
     last = ""
     for _ in range(retries + 1):
         try:
-            r = requests.post(url, json=payload, timeout=25)
+            r = requests.post(url, json=payload, timeout=45)
             r.raise_for_status()
             txt = (r.json().get("response") or "").strip()
             last = txt
@@ -948,7 +948,7 @@ def ollama_generate_season_block(season: str, tod: str, weather_line: str, retri
     last = ""
     for _ in range(retries + 1):
         try:
-            r = requests.post(url, json=payload, timeout=25)
+            r = requests.post(url, json=payload, timeout=45)
             r.raise_for_status()
             txt = (r.json().get("response") or "").strip()
             last = txt
@@ -1020,7 +1020,7 @@ def comfy_render_image(final_prompt: str, width: int, height: int, timeout_s: in
 
     while time.time() < deadline:
         #print(f"Polling Comfy history for {prompt_id}", flush=True)
-        h = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=30)
+        h = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=40)
         h.raise_for_status()
         hist = h.json().get(prompt_id)
 
