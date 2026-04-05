@@ -317,8 +317,8 @@ Check:
 
 ## Future improvements
 
-- add clothing overlay and tighten weather prompt
-- upload source portrait directly to ComfyUI instead of relying on a pre-existing input filename
+- upload firmware for esp32 13" spectra6 e-paper display
+- tighten weather prompt and clothing overlay
 - add image preview/debug endpoint
 - add stricter startup validation for required Home Assistant entities
 - expose a lightweight config/status page
