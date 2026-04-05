@@ -331,11 +331,6 @@ def ollama_daily_quote() -> str:
     return q
 
 def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
-    """
-    Returns:
-      {"lines": [...<=6], "summary_line": "...", "remaining": int}
-    """
-    # Prepare compact JSON for the model
     tasks = []
     for it in items_open_sorted:
         summary = _norm_ws(it.get("summary") or it.get("item") or "")
@@ -355,13 +350,23 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
         "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 220},
     }
 
-    r = requests.post(url, json=payload, timeout=25)
-    r.raise_for_status()
-    out = (r.json().get("response") or "").strip()
+    try:
+        r = requests.post(url, json=payload, timeout=60)
+        r.raise_for_status()
+        out = (r.json().get("response") or "").strip()
+        lines = [ln.rstrip() for ln in out.splitlines()]
+    except Exception as e:
+        print(f"todo formatting failed, falling back to raw lines: {e}", flush=True)
+        raw_lines = []
+        for t in tasks[:6]:
+            line = t["summary"]
+            if t["due"]:
+                line = f'{t["due"]} — {line}'
+            raw_lines.append(line)
+        while len(raw_lines) < 6:
+            raw_lines.append("")
+        return {"lines": raw_lines[:6], "summary_line": "+0 more — fallback mode"}
 
-    lines = [ln.rstrip() for ln in out.splitlines()]
-
-# Normalize to exactly 7 lines
     if len(lines) < 7:
         lines = lines + [""] * (7 - len(lines))
     elif len(lines) > 7:
@@ -963,8 +968,9 @@ def build_clothing_block(profile: dict) -> str:
     extras = ", ".join(profile.get("extras") or []) or "none"
     return (
         "CLOTHING OVERLAY:\n"
-        f"BaseTop: {profile.get('base_top') or 'none'}\n"
+        f"BaseTop: {profile.get('base_top') or 'none visible'}\n"
         f"Outerwear: {profile.get('outerwear') or 'none'}\n"
+        f"SafetyVest: {profile.get('vest')}\n"
         f"Legwear: {profile.get('legs')}\n"
         f"Footwear: {profile.get('boots')}\n"
         f"Extras: {extras}"

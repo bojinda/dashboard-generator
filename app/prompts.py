@@ -11,7 +11,8 @@ BASE_IMAGE_PROMPT = (
     "no mask, no phone, goatee.\n"
     "IMPORTANT: keep pose, identity, location, and composition unchanged. "
     "Clothing may be adjusted ONLY by the CLOTHING OVERLAY block. "
-    "Environment may be adjusted ONLY by the WEATHER OVERLAY and SEASONAL ENVIRONMENT blocks."
+    "Environment may be adjusted ONLY by the WEATHER OVERLAY and SEASONAL ENVIRONMENT blocks. "
+    "Treat the CLOTHING OVERLAY as required, not optional."
 )
 
 

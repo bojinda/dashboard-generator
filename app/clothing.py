@@ -22,10 +22,11 @@ def choose_clothing_profile(temp_c: float, precip: str, intensity: str, icy: boo
         if heavy_rain:
             profile["outerwear"] = "black waterproof rainsuit with black overalls and a long hooded black coat"
     elif temp_c >= 11:
-        profile["base_top"] = "blue hooded sweater"
+        profile["base_top"] = "dark navy blue hooded sweater"
         if heavy_rain:
             profile["outerwear"] = "black waterproof rainsuit with black overalls and a long hooded black coat"
     elif temp_c >= 1:
+        profile["base_top"] = "none visible under outerwear"
         if precip == "rain":
             profile["outerwear"] = "black waterproof rainsuit with black overalls and a long hooded black coat"
         else:
