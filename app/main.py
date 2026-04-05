@@ -19,6 +19,8 @@ from config import (
     EPD_PUSH_FAIL_HARD,
     EPD_ROTATE_CW,
 )
+from clothing import choose_clothing_profile
+
 from prompts import (
     BASE_IMAGE_PROMPT,
     build_quote_system_prompt,
@@ -29,7 +31,9 @@ from prompts import (
     build_overlay_user_prompt,
     build_season_system_prompt,
     build_season_user_prompt,
+    build_final_prompt,
 )
+
 from datetime import date, datetime, timedelta
 import threading
 import os
@@ -106,6 +110,41 @@ def ha_calendar_get_events_range(entity_id: str, start_dt: datetime, end_dt: dat
     }
 
     return ha_call_service("calendar", "get_events", data=data, return_response=True)
+
+def extract_clothing_weather_inputs(state_obj: dict) -> tuple[float, str, str, bool]:
+    attr = state_obj.get("attributes", {}) or {}
+    state = (state_obj.get("state") or "").lower().strip()
+
+    temp_raw = _first_present(attr, ["temperature", "temp"])
+    try:
+        temp_c = float(temp_raw)
+    except Exception:
+        temp_c = 10.0
+
+    precip = "none"
+    intensity = "none"
+    icy = False
+
+    if any(w in state for w in ["thunderstorm", "pouring", "storm"]):
+        precip = "rain"
+        intensity = "heavy"
+    elif any(w in state for w in ["rainy", "rain", "showers"]):
+        precip = "rain"
+        intensity = "moderate"
+    elif any(w in state for w in ["drizzle"]):
+        precip = "rain"
+        intensity = "light"
+    elif any(w in state for w in ["snowy", "snow", "flurr", "blizzard"]):
+        precip = "snow"
+        intensity = "moderate"
+    elif any(w in state for w in ["sleet", "freezing rain", "hail"]):
+        precip = "mixed"
+        intensity = "moderate"
+
+    if temp_c <= 0 or "ice" in state or "freezing" in state or precip in {"snow", "mixed"}:
+        icy = True
+
+    return temp_c, precip, intensity, icy
 
 TODO_AI_CACHE = {
     "hash": None,
@@ -771,14 +810,17 @@ _OVERLAY_RE = re.compile(
     re.MULTILINE
 )
 
-def overlay_is_valid(text: str, tod: str) -> bool:
+def overlay_is_valid(text: str, tod: str, weather_line: str = "") -> bool:
     if not text:
         return False
+
     t = text.strip()
     if not _OVERLAY_RE.match(t):
         return False
 
     low = t.lower()
+    weather_low = (weather_line or "").lower()
+
     forbidden_always = ["indoors", "umbrella", "mask", "phone", "helmet"]
     forbidden_day = ["moon", "moonlight", "starlight", "stars"]
     forbidden_night = ["sun", "sunlight", "daylight"]
@@ -789,6 +831,36 @@ def overlay_is_valid(text: str, tod: str) -> bool:
         return False
     if tod == "night" and any(w in low for w in forbidden_night):
         return False
+
+    rain_now = any(w in weather_low for w in [
+        "rain", "rainy", "pouring", "shower", "showers", "drizzle", "storm", "thunderstorm"
+    ])
+    snow_now = any(w in weather_low for w in [
+        "snow", "snowy", "flurr", "blizzard", "sleet", "hail"
+    ])
+    fog_now = any(w in weather_low for w in [
+        "fog", "foggy", "mist", "misty", "haze", "hazy"
+    ])
+    clear_now = any(w in weather_low for w in [
+        "clear", "sunny", "fair"
+    ])
+
+    rain_terms = ["rain", "drizzle", "showers", "raindrops", "rain streaks", "falling rain"]
+    snow_terms = ["snow", "flurries", "falling snow", "snowflakes", "blowing snow"]
+    fog_terms = ["fog", "mist", "haze", "low visibility"]
+    clear_terms = ["clear", "dry air", "bright", "sunlit", "crisp air"]
+
+    if rain_now and not any(term in low for term in rain_terms):
+        return False
+    if snow_now and not any(term in low for term in snow_terms):
+        return False
+    if fog_now and not any(term in low for term in fog_terms):
+        return False
+
+    # Optional: stop the model from inventing rain during clearly dry weather
+    if clear_now and any(term in low for term in rain_terms + snow_terms):
+        return False
+
     return True
 
 def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> str:
@@ -811,7 +883,7 @@ def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> st
             r.raise_for_status()
             txt = (r.json().get("response") or "").strip()
             last = txt
-            if overlay_is_valid(txt, tod):
+            if overlay_is_valid(txt, tod, weather_line):
                 return txt
         except Exception as e:
             last = (
@@ -887,8 +959,16 @@ def ollama_generate_season_block(season: str, tod: str, weather_line: str, retri
             )
     return last.strip()
 
-def build_final_prompt(base_prompt: str, overlay_block: str) -> str:
-    return base_prompt.strip() + "\n\n" + overlay_block.strip()
+def build_clothing_block(profile: dict) -> str:
+    extras = ", ".join(profile.get("extras") or []) or "none"
+    return (
+        "CLOTHING OVERLAY:\n"
+        f"BaseTop: {profile.get('base_top') or 'none'}\n"
+        f"Outerwear: {profile.get('outerwear') or 'none'}\n"
+        f"Legwear: {profile.get('legs')}\n"
+        f"Footwear: {profile.get('boots')}\n"
+        f"Extras: {extras}"
+    )
 
 def clean_for_json(s: str) -> str:
     s = s.replace("\r\n", "\n").replace("\r", "\n")
@@ -1012,8 +1092,17 @@ def render_wallpaper(path: str):
 
     overlay = ollama_generate_overlay(weather_line, tod)
     season_block = ollama_generate_season_block(season, tod, weather_line)
+    temp_c, precip, intensity, icy = extract_clothing_weather_inputs(w)
+    clothing_profile = choose_clothing_profile(temp_c, precip, intensity, icy)
 
-    final_prompt = build_final_prompt(base_prompt, overlay) + "\n\n" + season_block
+    clothing_block = build_clothing_block(clothing_profile)
+
+    final_prompt = build_final_prompt(
+        base_prompt,
+        overlay,
+        season_block,
+        clothing_block,
+    )
     final_prompt = clean_for_json(final_prompt)
 
     title_font = load_font(60)

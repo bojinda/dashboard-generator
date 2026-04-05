@@ -8,10 +8,10 @@ BASE_IMAGE_PROMPT = (
     "Turn the man from image 1 into a freight train conductor in the style of a mature, gritty shonen anime. "
     "The man is standing by a switch, away from the tracks, and holding a lantern. "
     "Keep original features of the man the same. same dark tanned skin tone. Outdoors in woods, "
-    "work clothes, no mask, no phone, goatee, a closed thick black canvass jacket, "
-    "orange safety vest worn over jacket.\n"
-    "IMPORTANT: keep clothing, pose, identity, location, and composition unchanged. "
-    "Only environment weather changes."
+    "no mask, no phone, goatee.\n"
+    "IMPORTANT: keep pose, identity, location, and composition unchanged. "
+    "Clothing may be adjusted ONLY by the CLOTHING OVERLAY block. "
+    "Environment may be adjusted ONLY by the WEATHER OVERLAY and SEASONAL ENVIRONMENT blocks."
 )
 
 
@@ -103,6 +103,13 @@ def build_overlay_system_prompt(tod: str) -> str:
         "Rules:\n"
         "- DO NOT change character, clothing, props, location, composition, or style.\n"
         f"{celestial_rule}"
+        "- The weather description refers to conditions happening RIGHT NOW.\n"
+        "- If weather indicates rain, drizzle, showers, storm, or thunderstorm, show ACTIVE precipitation.\n"
+        "- If weather indicates snow, flurries, or blizzard, show ACTIVE falling snow.\n"
+        "- If weather indicates fog or mist, make it visibly present in the air.\n"
+        "- Do not reduce active weather to aftermath only.\n"
+        "- Wet ground and puddles are good supporting details, but they are NOT enough by themselves when precipitation is currently happening.\n"
+        "- Keep the effect realistic and moderately visible, not extreme unless the weather clearly suggests it.\n"
         "- Output EXACTLY 5 lines in this exact format:\n"
         "WEATHER OVERLAY:\n"
         "Sky: ...\n"
@@ -110,16 +117,21 @@ def build_overlay_system_prompt(tod: str) -> str:
         "Ground: ...\n"
         "LanternLight: ...\n"
         "- Each line after the label must be 6-16 words.\n"
-        "- LanternLight must ONLY describe interaction with weather/surfaces.\n"
+        "- Sky describes clouds, visibility, and overall sky condition.\n"
+        "- Air describes visible weather in the air right now: rain, drizzle, snow, mist, haze, wind-blown particles.\n"
+        "- Ground describes current surface effects: wet ties, puddles, slush, dust, dry ballast, reflections.\n"
+        "- LanternLight must ONLY describe how light interacts with weather and nearby surfaces.\n"
         "- No extra text."
     )
 
 
 def build_overlay_user_prompt(weather_line: str) -> str:
     return (
-        "Weather now (for visuals only):\n"
+        "Current weather conditions happening now:\n"
         f"{weather_line}\n\n"
-        "Make the overlay match subtly and realistically."
+        "Make the overlay match the current weather exactly.\n"
+        "If precipitation is happening now, it must be visible in the Air line and supported elsewhere.\n"
+        "Do not describe only recent aftermath unless the weather is clearly not active."
     )
 
 
@@ -153,3 +165,12 @@ def build_season_user_prompt(season: str, tod: str, weather_line: str) -> str:
         f"{weather_line}\n"
         "Write subtle seasonal cues (e.g., leaves, ground cover, haze, mud, frost)."
     )
+
+
+def build_final_prompt(base_prompt: str, *blocks: str) -> str:
+    parts = [base_prompt.strip()]
+    for block in blocks:
+        block = (block or "").strip()
+        if block:
+            parts.append(block)
+    return "\n\n".join(parts)
