@@ -315,7 +315,7 @@ Check:
 
 ## Future improvements
 
-- add season overlay and tighten weather prompt
+- add clothing overlay and tighten weather prompt
 - upload source portrait directly to ComfyUI instead of relying on a pre-existing input filename
 - add image preview/debug endpoint
 - add stricter startup validation for required Home Assistant entities
