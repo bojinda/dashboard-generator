@@ -317,7 +317,7 @@ Check:
 
 ## Future improvements
 
-- upload firmware for esp32 13" spectra6 e-paper display
+- upload firmware for esp32 based 13" spectra6 e-paper display
 - tighten weather prompt and clothing overlay
 - add image preview/debug endpoint
 - add stricter startup validation for required Home Assistant entities
