@@ -32,10 +32,10 @@ def choose_clothing_profile(temp_c: float, precip: str, intensity: str, icy: boo
         else:
             profile["outerwear"] = "black nylon weatherproof spring jacket"
     else:
-        profile["outerwear"] = "heavy winter work outerwear"
+        profile["outerwear"] = "heavy black carhartt style canvas jacket"
 
     if frozen and not profile["outerwear"]:
-        profile["outerwear"] = "heavy winter work outerwear"
+        profile["outerwear"] = "heavy black carhartt style canvas jacket"
 
     if icy or frozen:
         profile["extras"].append("ice cleats fitted over the boots")
