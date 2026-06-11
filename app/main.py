@@ -269,6 +269,29 @@ def _todo_items_open_sorted(entity_id: str) -> list[dict]:
     open_items.sort(key=sort_key)
     return open_items
 
+
+def ollama_unload_model() -> None:
+    """
+    Ask Ollama to unload the configured model from memory/VRAM after dashboard work.
+    """
+    try:
+        url = f"{OLLAMA_URL}/api/generate"
+        payload = {
+            "model": OLLAMA_MODEL,
+            "prompt": "",
+            "stream": False,
+            "keep_alive": 0,
+            "options": {
+                "num_predict": 0,
+                "num_ctx": 512,
+            },
+        }
+        r = requests.post(url, json=payload, timeout=20)
+        print(f"[ollama] unload {OLLAMA_MODEL}: HTTP {r.status_code}", flush=True)
+    except Exception as e:
+        print(f"[ollama] unload failed: {e}", flush=True)
+
+
 def ollama_daily_quote() -> str:
     """
     Generate 1 quote per day via Ollama and cache it.
@@ -1505,6 +1528,7 @@ def _run_render_job():
             LAST_JOB["finished"] = time.time()
 
     finally:
+        ollama_unload_model()
         with JOB_LOCK:
             JOB_RUNNING = False
 
