@@ -13,7 +13,7 @@
     "inputs": {
       "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
       "type": "qwen_image",
-      "device": "default"
+      "device": "cpu"
     },
     "class_type": "CLIPLoader",
     "_meta": {
@@ -127,20 +127,6 @@
       "title": "Save Image"
     }
   },
-  "94": {
-    "inputs": {
-      "purge_cache": true,
-      "purge_models": true,
-      "anything": [
-        "7",
-          0
-      ]
-    },
-    "class_type": "LayerUtility: PurgeVRAM",
-    "_meta": {
-    "title": "LayerUtility: Purge VRAM"
-    }
-  },
   "40": {
     "inputs": {
       "aspect_ratio": "custom",
@@ -172,6 +158,34 @@
     "class_type": "PrimitiveStringMultiline",
     "_meta": {
       "title": "Prompt"
+    }
+  },
+  "94": {
+    "inputs": {
+      "purge_cache": true,
+      "purge_models": true,
+      "anything": [
+        "7",
+        0
+      ]
+    },
+    "class_type": "LayerUtility: PurgeVRAM",
+    "_meta": {
+      "title": "LayerUtility: Purge VRAM"
+    }
+  },
+  "95": {
+    "inputs": {
+      "purge_cache": true,
+      "purge_models": true,
+      "anything": [
+        "40",
+        0
+      ]
+    },
+    "class_type": "LayerUtility: PurgeVRAM",
+    "_meta": {
+      "title": "LayerUtility: Purge VRAM"
     }
   }
 }

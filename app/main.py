@@ -982,6 +982,26 @@ def clean_for_json(s: str) -> str:
     return s
 
 # -------- COMFYUI --------
+
+def randomize_workflow_seeds(workflow: dict) -> dict:
+    import random
+
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+
+        for key in list(inputs.keys()):
+            if key.lower() in {"seed", "noise_seed"}:
+                old = inputs[key]
+                inputs[key] = random.randint(0, 2**63 - 1)
+                print(f"[seed] randomized node {node_id} {key}: {old} -> {inputs[key]}", flush=True)
+
+    return workflow
+
 def comfy_render_image(final_prompt: str, width: int, height: int, timeout_s: int = 900) -> Image.Image | None:
     with open(COMFY_WORKFLOW_FILE, "r", encoding="utf-8") as f:
         workflow = json.load(f)
@@ -989,6 +1009,15 @@ def comfy_render_image(final_prompt: str, width: int, height: int, timeout_s: in
     # 1) set prompt + input image
     workflow["88"]["inputs"]["value"] = final_prompt
     workflow["9"]["inputs"]["image"] = COMFY_INPUT_IMAGE
+    print("========== DASHBOARD FINAL PROMPT ==========", flush=True)
+    print(final_prompt[:3000], flush=True)
+    print("========== WORKFLOW NODE 88 ==========", flush=True)
+    print(workflow["88"]["inputs"], flush=True)
+    try:
+        print("========== WORKFLOW NODE 7 SEED ==========", flush=True)
+        print(workflow["7"]["inputs"].get("seed"), flush=True)
+    except Exception as e:
+        print(f"Could not print seed: {e}", flush=True)
 
     # 2) set target size on node 40 (BEFORE queueing!)
     workflow["40"]["inputs"]["aspect_ratio"] = "custom"
@@ -1005,6 +1034,7 @@ def comfy_render_image(final_prompt: str, width: int, height: int, timeout_s: in
     #print(f"COMFY workflow file -> {COMFY_WORKFLOW_FILE}", flush=True)
 
     # 3) queue
+    workflow = randomize_workflow_seeds(workflow)
     r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=40)
     #print(f"COMFY /prompt status -> {r.status_code}", flush=True)
     #print(f"COMFY /prompt body -> {r.text[:800]}", flush=True)
@@ -1098,6 +1128,27 @@ def render_wallpaper(path: str):
 
     overlay = ollama_generate_overlay(weather_line, tod)
     season_block = ollama_generate_season_block(season, tod, weather_line)
+
+    if not overlay.strip():
+        print("[weather] Ollama overlay returned empty; using deterministic fallback", flush=True)
+        overlay = (
+            "WEATHER OVERLAY:\n"
+            f"Sky: {tod} sky matching {weather_line}\n"
+            f"Air: humid outdoor air with current {weather_line}\n"
+            "Ground: trackside ballast and forest floor reflect current conditions\n"
+            "LanternLight: lantern glow catches moisture and nearby surfaces"
+        )
+
+    if not season_block.strip():
+        print("[season] Ollama season block returned empty; using deterministic fallback", flush=True)
+        season_block = (
+            "SEASONAL ENVIRONMENT:\n"
+            f"Trees: summer woods with full leafy branches around the scene\n"
+            "Ground: dense summer undergrowth beside the ballast and switch stand\n"
+            f"Air: warm humid {tod} atmosphere with soft depth\n"
+            "DistantDetails: dark green foliage fades into the background"
+        )
+
     temp_c, precip, intensity, icy = extract_clothing_weather_inputs(w)
     clothing_profile = choose_clothing_profile(temp_c, precip, intensity, icy)
 
