@@ -289,7 +289,7 @@ def ollama_daily_quote() -> str:
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 80},
+        "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 80, "num_ctx": 4096},
 }
 
     fallback_quotes = [
@@ -347,7 +347,7 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 220},
+        "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 220, "num_ctx": 4096},
     }
 
     try:
@@ -878,7 +878,7 @@ def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> st
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 200},
+        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 200, "num_ctx": 4096},
     }
 
     last = ""
@@ -942,7 +942,7 @@ def ollama_generate_season_block(season: str, tod: str, weather_line: str, retri
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 200},
+        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 200, "num_ctx": 4096},
     }
 
     last = ""
