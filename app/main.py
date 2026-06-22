@@ -635,12 +635,21 @@ def _parse_ha_iso(dt_str: str):
 def infer_day_or_night_from_weather(state_obj: dict) -> str:
     """
     Returns "day" or "night".
-    Prefers sunrise/sunset from weather attributes if present; falls back to local hour.
+    Prefer Home Assistant sun.sun if available.
+    Fall back to weather sunrise/sunset if present.
+    Last resort: local hour.
     """
-    attr = state_obj.get("attributes", {}) or {}
+    sun = ha_try_get("sun.sun")
+    if sun:
+        sun_state = (sun.get("state") or "").lower().strip()
+        if sun_state == "above_horizon":
+            return "day"
+        if sun_state == "below_horizon":
+            return "night"
 
+    attr = state_obj.get("attributes", {}) or {}
     sunrise = _parse_ha_iso(attr.get("sunrise"))
-    sunset  = _parse_ha_iso(attr.get("sunset"))
+    sunset = _parse_ha_iso(attr.get("sunset"))
     now = datetime.now().astimezone()
 
     if sunrise and sunset:
