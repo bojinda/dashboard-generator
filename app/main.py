@@ -1,5 +1,5 @@
 # /opt/dashboard-gen/app/main.py
-from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
 from PIL import Image, ImageDraw, ImageFont
 from config import (
     OUT_PATH,
@@ -20,6 +20,9 @@ from config import (
     EPD_ROTATE_CW,
 )
 from clothing import choose_clothing_profile
+from gpu_runner import generate as runner_generate, wallpaper as runner_wallpaper
+from aihub_gpu_runner.client import CURRENT_OPERATION, CoordinationError, OutputBusy, OutputSlot
+
 
 from prompts import (
     BASE_IMAGE_PROMPT,
@@ -270,28 +273,6 @@ def _todo_items_open_sorted(entity_id: str) -> list[dict]:
     return open_items
 
 
-def ollama_unload_model() -> None:
-    """
-    Ask Ollama to unload the configured model from memory/VRAM after dashboard work.
-    """
-    try:
-        url = f"{OLLAMA_URL}/api/generate"
-        payload = {
-            "model": OLLAMA_MODEL,
-            "prompt": "",
-            "stream": False,
-            "keep_alive": 0,
-            "options": {
-                "num_predict": 0,
-                "num_ctx": 512,
-            },
-        }
-        r = requests.post(url, json=payload, timeout=20)
-        print(f"[ollama] unload {OLLAMA_MODEL}: HTTP {r.status_code}", flush=True)
-    except Exception as e:
-        print(f"[ollama] unload failed: {e}", flush=True)
-
-
 def ollama_daily_quote() -> str:
     """
     Generate 1 quote per day via Ollama and cache it.
@@ -326,14 +307,15 @@ def ollama_daily_quote() -> str:
 
     q = ""
     try:
-        for _ in range(3):
-            r = requests.post(url, json=payload, timeout=45)
-            r.raise_for_status()
-            raw = (r.json().get("response") or "").strip().splitlines()[0].strip()
+        for attempt in range(3):
+            data = runner_generate(payload, f"quote-{today}-{attempt}")
+            raw = (data.get("response") or "").strip().splitlines()[0].strip()
             raw = clean_quote_text(raw)
             if quote_is_usable(raw):
                 q = raw
                 break
+    except CoordinationError:
+        raise
     except Exception:
         q = ""
 
@@ -374,10 +356,11 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
     }
 
     try:
-        r = requests.post(url, json=payload, timeout=60)
-        r.raise_for_status()
-        out = (r.json().get("response") or "").strip()
+        data = runner_generate(payload, "todo-format")
+        out = (data.get("response") or "").strip()
         lines = [ln.rstrip() for ln in out.splitlines()]
+    except CoordinationError:
+        raise
     except Exception as e:
         print(f"todo formatting failed, falling back to raw lines: {e}", flush=True)
         raw_lines = []
@@ -914,14 +897,15 @@ def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> st
     }
 
     last = ""
-    for _ in range(retries + 1):
+    for attempt in range(retries + 1):
         try:
-            r = requests.post(url, json=payload, timeout=45)
-            r.raise_for_status()
-            txt = (r.json().get("response") or "").strip()
+            data = runner_generate(payload, f"weather-overlay-{attempt}")
+            txt = (data.get("response") or "").strip()
             last = txt
             if overlay_is_valid(txt, tod, weather_line):
                 return txt
+        except CoordinationError:
+            raise
         except Exception as e:
             last = (
                 "WEATHER OVERLAY:\n"
@@ -978,14 +962,15 @@ def ollama_generate_season_block(season: str, tod: str, weather_line: str, retri
     }
 
     last = ""
-    for _ in range(retries + 1):
+    for attempt in range(retries + 1):
         try:
-            r = requests.post(url, json=payload, timeout=45)
-            r.raise_for_status()
-            txt = (r.json().get("response") or "").strip()
+            data = runner_generate(payload, f"season-block-{attempt}")
+            txt = (data.get("response") or "").strip()
             last = txt
             if season_is_valid(txt):
                 return txt
+        except CoordinationError:
+            raise
         except Exception as e:
             last = (
                 "SEASONAL ENVIRONMENT:\n"
@@ -1067,52 +1052,11 @@ def comfy_render_image(final_prompt: str, width: int, height: int, timeout_s: in
 
     # 3) queue
     workflow = randomize_workflow_seeds(workflow)
-    r = requests.post(f"{COMFY_URL}/prompt", json={"prompt": workflow}, timeout=40)
-    #print(f"COMFY /prompt status -> {r.status_code}", flush=True)
-    #print(f"COMFY /prompt body -> {r.text[:800]}", flush=True)
+    data, media_type = runner_wallpaper(workflow)
+    if media_type != "image/png":
+        raise RuntimeError("Runner wallpaper artifact must be PNG")
+    return Image.open(io.BytesIO(data)).convert("RGB")
 
-    if r.status_code != 200:
-        raise RuntimeError(f"Comfy /prompt failed: HTTP {r.status_code} body={r.text[:1000]}")
-
-    prompt_id = r.json()["prompt_id"]
-    #print(f"COMFY prompt_id -> {prompt_id}", flush=True)
-
-    deadline = time.time() + timeout_s
-    last_err = None
-
-    while time.time() < deadline:
-        #print(f"Polling Comfy history for {prompt_id}", flush=True)
-        h = requests.get(f"{COMFY_URL}/history/{prompt_id}", timeout=40)
-        h.raise_for_status()
-        hist = h.json().get(prompt_id)
-
-        # If the workflow failed, Comfy usually includes an "error" object somewhere in history
-        if hist and hist.get("status") == "error":
-            last_err = str(hist.get("error") or hist.get("messages") or "unknown comfy error")
-            break
-
-        if hist and hist.get("outputs"):
-            for _, out in hist["outputs"].items():
-                imgs = out.get("images") or []
-                if imgs:
-                    img_meta = imgs[0]
-                    params = {
-                        "filename": img_meta["filename"],
-                        "subfolder": img_meta.get("subfolder", ""),
-                        "type": img_meta.get("type", "output"),
-                    }
-                    img_r = requests.get(f"{COMFY_URL}/view", params=params, timeout=60)
-                    img_r.raise_for_status()
-                    #print(f"History status keys: {list(h.json().keys())[:5]}", flush=True)
-                    return Image.open(io.BytesIO(img_r.content)).convert("RGB")
-
-        time.sleep(1.5)
-
-    # Surface a useful error if we saw one
-    if last_err:
-        raise RuntimeError(f"Comfy workflow error: {last_err}")
-
-    raise TimeoutError(f"ComfyUI render timed out after {timeout_s}s waiting for output image.")
 
 def draw_multiline(draw: ImageDraw.ImageDraw, xy, text: str, font, fill, line_spacing: int = 8):
     x, y = xy
@@ -1215,6 +1159,8 @@ def render_wallpaper(path: str):
         box_w, box_h = (x1 - x0), (y1 - y0)
 
         picture = comfy_render_image(final_prompt, width=box_w, height=box_h)
+    except CoordinationError:
+        raise
     except Exception as e:
         err = f"Comfy error:\n{str(e)[:220]}"
         draw_multiline(d, (pic[0] + 28, pic[1] + 28), err, font=small_font, fill=(230, 180, 180))
@@ -1500,46 +1446,61 @@ def render_wallpaper(path: str):
     img.save(path, "PNG")
 
 # -------- JOB RUNNER --------
-def _run_render_job():
+_OUTPUT_SLOT = None
+
+def _output_slot():
+    global _OUTPUT_SLOT
+    if _OUTPUT_SLOT is None:
+        _OUTPUT_SLOT = OutputSlot(os.environ.get("GPU_RUNNER_CLIENT_STATE", "/var/lib/dashboard-gpu-client"),
+                                  [OUT_PATH, os.path.join(os.path.dirname(OUT_PATH), "image_data.bin")])
+    return _OUTPUT_SLOT
+
+def _reserve_output(kind, request_id=None):
     global JOB_RUNNING, LAST_JOB
     with JOB_LOCK:
-        JOB_RUNNING = True
-        LAST_JOB = {"status": "running", "started": time.time(), "finished": None, "error": None}
+        try:
+            operation = _output_slot().begin(kind, request_id if isinstance(request_id, str) else None)
+        except OutputBusy:
+            return None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid X-Request-ID")
+        except CoordinationError as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        if not operation.cached:
+            JOB_RUNNING = True
+            LAST_JOB = _operation_status(operation.record)
+        return operation
 
+def _operation_status(record):
+    return {key: record[key] for key in ("status", "started", "finished", "error", "request_id") if key in record}
+
+def _finish_output(operation, response=None, error=None):
+    global JOB_RUNNING, LAST_JOB
+    try:
+        operation.finish(response, error)
+    finally:
+        with JOB_LOCK:
+            JOB_RUNNING = False
+            LAST_JOB = _operation_status(operation.record)
+
+def _run_render_job(operation):
+    token = CURRENT_OPERATION.set(operation)
     try:
         os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-
-        # 1) wallpaper
         render_wallpaper(OUT_PATH)
-
-        # 2) bin
         bin_path = os.path.join(os.path.dirname(OUT_PATH), "image_data.bin")
         n = generate_epaper_bin_epdoptimize(OUT_PATH, bin_path)
-
-        # 3) optional push
         try:
             push_bin_to_epd(bin_path)
         except Exception as e:
             if EPD_PUSH_FAIL_HARD:
                 raise
-            # soft-fail: log but still mark render ok
             print(f"EPD push failed (soft): {e}")
-
-        with JOB_LOCK:
-            LAST_JOB["status"] = "ok"
-            LAST_JOB["finished"] = time.time()
-            LAST_JOB["error"] = None
-
+        _finish_output(operation, {"ok": True, "queued": False, "status": "ok"})
     except Exception as e:
-        with JOB_LOCK:
-            LAST_JOB["status"] = "error"
-            LAST_JOB["error"] = str(e)
-            LAST_JOB["finished"] = time.time()
-
+        _finish_output(operation, error=str(e))
     finally:
-        ollama_unload_model()
-        with JOB_LOCK:
-            JOB_RUNNING = False
+        CURRENT_OPERATION.reset(token)
 
 # -------- API --------
 @app.post("/todo_ai_refresh")
@@ -1614,7 +1575,24 @@ def todo_ai_refresh():
     }
 
 @app.post("/render_test")
-def render_test():
+def render_test(request_id: str | None = Header(None, alias="X-Request-ID")):
+    operation = _reserve_output("render-test", request_id)
+    if operation is None:
+        return {"ok": True, "queued": False, "status": "busy"}
+    if operation.cached:
+        return operation.record["response"]
+    token = CURRENT_OPERATION.set(operation)
+    try:
+        response = _render_test_body()
+        _finish_output(operation, response)
+        return response
+    except Exception as exc:
+        _finish_output(operation, error=str(exc))
+        raise
+    finally:
+        CURRENT_OPERATION.reset(token)
+
+def _render_test_body():
     """
     Fast test path:
     - does NOT call HA
@@ -1656,15 +1634,39 @@ def todo_generate_today():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/render_async")
-def render_async(background_tasks: BackgroundTasks):
-    with JOB_LOCK:
-        if JOB_RUNNING:
-            return {"ok": True, "queued": False, "status": "busy"}
-    background_tasks.add_task(_run_render_job)
+def render_async(background_tasks: BackgroundTasks, request_id: str | None = Header(None, alias="X-Request-ID")):
+    operation = _reserve_output("render-async", request_id)
+    if operation is None:
+        return {"ok": True, "queued": False, "status": "busy"}
+    if operation.cached:
+        return operation.record["response"]
+    try:
+        background_tasks.add_task(_run_render_job, operation)
+    except Exception as exc:
+        _finish_output(operation, error=str(exc))
+        raise
     return {"ok": True, "queued": True}
 
+
 @app.post("/render_test_path")
-def render_test_path(path: str):
+def render_test_path(path: str, request_id: str | None = Header(None, alias="X-Request-ID")):
+    operation = _reserve_output("render-test-path:" + os.path.realpath(path), request_id)
+    if operation is None:
+        return {"ok": True, "queued": False, "status": "busy"}
+    if operation.cached:
+        return operation.record["response"]
+    token = CURRENT_OPERATION.set(operation)
+    try:
+        response = _render_test_path_body(path)
+        _finish_output(operation, response)
+        return response
+    except Exception as exc:
+        _finish_output(operation, error=str(exc))
+        raise
+    finally:
+        CURRENT_OPERATION.reset(token)
+
+def _render_test_path_body(path: str):
     """
     Convert and push any existing PNG on disk.
     Example:
@@ -1693,10 +1695,28 @@ def render_test_path(path: str):
 @app.get("/render_status")
 def render_status():
     with JOB_LOCK:
-        return {"ok": True, "running": JOB_RUNNING, "last": LAST_JOB}
+        last = _operation_status(_output_slot().status())
+        return {"ok": True, "running": last["status"] == "running", "last": last}
 
 @app.post("/render")
-def render():
+def render(request_id: str | None = Header(None, alias="X-Request-ID")):
+    operation = _reserve_output("render", request_id)
+    if operation is None:
+        return {"ok": True, "queued": False, "status": "busy"}
+    if operation.cached:
+        return operation.record["response"]
+    token = CURRENT_OPERATION.set(operation)
+    try:
+        response = _render_body()
+        _finish_output(operation, response)
+        return response
+    except Exception as exc:
+        _finish_output(operation, error=str(exc))
+        raise
+    finally:
+        CURRENT_OPERATION.reset(token)
+
+def _render_body():
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
     render_wallpaper(OUT_PATH)
 

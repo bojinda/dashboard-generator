@@ -2,6 +2,20 @@
 
 # Dashboard Generator
 
+Current R2 adapter status: offline implementation only, not deployed. GPU work
+uses the canonical `aihub-gpu-runner` job client: GPU1 Ollama finishes cleanup and
+release before named GPU0 wallpaper work. Coordination is not duplicated here.
+See [the canonical roadmap](../aihub-gpu-runner/roadmap.md) and
+[client/deployment gates](../aihub-gpu-runner/docs/dashboard-client.md).
+
+Existing HA endpoints and normal responses remain. For retries, optionally supply
+the same `X-Request-ID` to the same render endpoint; concurrent triggers report
+busy and completed IDs return the recorded response without duplicate generation.
+New intentional work needs a new ID. Configure private persistent client state,
+runner authentication and the reviewed canonical SDK before any separately
+approved deployment. Existing Docker/Compose, ComfyUI environments and output
+paths are unchanged. No live jobs or caller resumption are authorized.
+
 A self-hosted dashboard image generator for e-paper or wall display use.
 
 This project builds a single dashboard image that combines:
