@@ -293,7 +293,7 @@ def ollama_daily_quote() -> str:
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 80, "num_ctx": 4096},
+        "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 512, "num_ctx": 4096},
 }
 
     fallback_quotes = [
@@ -309,7 +309,13 @@ def ollama_daily_quote() -> str:
     try:
         for attempt in range(3):
             data = runner_generate(payload, f"quote-{today}-{attempt}")
-            raw = (data.get("response") or "").strip().splitlines()[0].strip()
+            raw = (data.get("response") or "").strip()
+            print(f"quote: final_empty={not bool(raw)} done={data.get('done') is True} "
+                  f"length_limit={data.get('done_reason') == 'length'} "
+                  f"thinking_present={bool(data.get('thinking'))}", flush=True)
+            if not raw:
+                break
+            raw = raw.splitlines()[0].strip()
             raw = clean_quote_text(raw)
             if quote_is_usable(raw):
                 q = raw
@@ -352,26 +358,37 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 220, "num_ctx": 4096},
+        "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 1024, "num_ctx": 4096},
     }
 
     try:
         data = runner_generate(payload, "todo-format")
         out = (data.get("response") or "").strip()
+        print(f"todo-format: final_empty={not bool(out)} done={data.get('done') is True} "
+              f"length_limit={data.get('done_reason') == 'length'} "
+              f"thinking_present={bool(data.get('thinking'))}", flush=True)
+        if data.get("done_reason") == "length":
+            raise ValueError("incomplete_todo_generation")
         lines = [ln.rstrip() for ln in out.splitlines()]
+        if not out or (tasks and not any(
+                not is_effectively_blank_line(ln) and
+                not (ln.lstrip().startswith("+") and "more" in ln.lower()) for ln in lines[:6])):
+            raise ValueError("empty_final_task_response")
     except CoordinationError:
         raise
     except Exception as e:
-        print(f"todo formatting failed, falling back to raw lines: {e}", flush=True)
+        print(f"todo formatting failed; using Home Assistant tasks ({type(e).__name__})", flush=True)
         raw_lines = []
         for t in tasks[:6]:
             line = t["summary"]
+            if t["description"]:
+                line = f'{line} — {_norm_ws(t["description"])}' if line else _norm_ws(t["description"])
             if t["due"]:
                 line = f'{t["due"]} — {line}'
             raw_lines.append(line)
         while len(raw_lines) < 6:
             raw_lines.append("")
-        return {"lines": raw_lines[:6], "summary_line": "+0 more — fallback mode"}
+        return {"lines": raw_lines[:6], "summary_line": "+0 more — fallback mode", "fallback": True}
 
     if len(lines) < 7:
         lines = lines + [""] * (7 - len(lines))
@@ -1560,7 +1577,7 @@ def todo_ai_refresh():
         lines[6] = "+0 more — no more tasks"
 
     with TODO_AI_LOCK:
-        TODO_AI_CACHE["hash"] = h
+        TODO_AI_CACHE["hash"] = None if formatted.get("fallback") else h
         TODO_AI_CACHE["lines"] = lines[:6]
         TODO_AI_CACHE["summary_line"] = lines[6]
         TODO_AI_CACHE["ts"] = int(time.time())
