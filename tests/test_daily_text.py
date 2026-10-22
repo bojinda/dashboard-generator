@@ -26,11 +26,16 @@ def text_functions():
         'clean_quote_text', 'quote_is_usable', 'ollama_daily_quote',
         'ollama_format_todo', 'todo_ai_refresh', 'ollama_generate_overlay',
         'ollama_generate_season_block', 'scrub_precip_words',
+        'overlay_is_valid', 'season_is_valid',
     }
     source = ast.parse((ROOT / 'app/main.py').read_text(encoding='utf-8'))
-    functions = [node for node in source.body if isinstance(node, ast.FunctionDef) and node.name in names]
+    functions = [node for node in source.body if
+                 (isinstance(node, ast.FunctionDef) and node.name in names) or
+                 (isinstance(node, ast.Assign) and any(
+                     isinstance(t, ast.Name) and t.id in {'_OVERLAY_RE', '_SEASON_RE'} for t in node.targets))]
     for node in functions:
-        node.decorator_list = []  # Exercise the endpoint body without starting FastAPI.
+        if isinstance(node, ast.FunctionDef):
+            node.decorator_list = []  # Exercise the endpoint body without starting FastAPI.
     namespace = {
         'date': date, 'hashlib': hashlib, 'json': json, 're': re, 'time': time,
         'OLLAMA_MODEL': 'qwen3.8:27b', 'OLLAMA_URL': 'http://offline.invalid',
@@ -40,7 +45,6 @@ def text_functions():
         'TODO_AI_CACHE': {'hash': None, 'day': None, 'lines': [], 'summary_line': '', 'ts': 0},
         'runner_generate': Mock(return_value={}),
         '_todo_items_open_sorted': Mock(side_effect=AssertionError('live HA forbidden')),
-        'overlay_is_valid': Mock(return_value=True), 'season_is_valid': Mock(return_value=True),
     }
     for name in ('quote_system', 'quote_user', 'todo_system', 'todo_user',
                  'overlay_system', 'overlay_user', 'season_system', 'season_user'):
@@ -70,7 +74,7 @@ class DailyTextTests(unittest.TestCase):
         self.assertEqual(result, {'lines': self.lines[:6], 'summary_line': self.lines[6]})
         payload, step = self.app['runner_generate'].call_args.args
         self.assertEqual(step, 'todo-format')
-        self.assertEqual(payload['options'], {'temperature': .2, 'top_p': .9, 'num_predict': 1024, 'num_ctx': 4096})
+        self.assertEqual(payload['options'], {'temperature': .2, 'top_p': .9, 'num_predict': 4096, 'num_ctx': 16384})
         self.assertEqual(payload['model'], 'qwen3.8:27b')
         self.assertNotIn('think', payload)
         self.assertNotIn('think', payload['options'])
@@ -83,7 +87,7 @@ class DailyTextTests(unittest.TestCase):
         self.assertEqual(self.app['ollama_daily_quote'](), quote)
         self.app['runner_generate'].assert_called_once()
         payload, _ = self.app['runner_generate'].call_args.args
-        self.assertEqual(payload['options'], {'temperature': 1.0, 'top_p': .95, 'num_predict': 512, 'num_ctx': 4096})
+        self.assertEqual(payload['options'], {'temperature': 1.0, 'top_p': .95, 'num_predict': 2048, 'num_ctx': 16384})
         self.assertEqual(payload['model'], 'qwen3.8:27b')
         self.assertFalse(payload['stream'])
         self.assertNotIn('think', payload)
@@ -153,7 +157,9 @@ class DailyTextTests(unittest.TestCase):
 
     def test_coordination_failures_still_propagate(self):
         self.app['runner_generate'].side_effect = SyntheticCoordinationError('held')
-        for name, args in [('ollama_format_todo', (self.items,)), ('ollama_daily_quote', ())]:
+        for name, args in [('ollama_format_todo', (self.items,)), ('ollama_daily_quote', ()),
+                           ('ollama_generate_overlay', ('clear', 'day')),
+                           ('ollama_generate_season_block', ('autumn', 'day', 'clear'))]:
             with self.subTest(function=name), self.assertRaises(SyntheticCoordinationError):
                 self.app[name](*args)
 
@@ -170,17 +176,79 @@ class DailyTextTests(unittest.TestCase):
         for private in (secret, 'Original detail A', 'Task A', 'synthetic-private-error-payload'):
             self.assertNotIn(private, logs)
 
-    def test_other_ollama_requests_keep_their_budgets_and_options(self):
-        self.app['runner_generate'].return_value = {'response': 'synthetic output'}
-        self.app['ollama_generate_overlay']('clear', 'day')
-        self.app['ollama_generate_season_block']('autumn', 'day', 'clear')
+    def structured_cases(self):
+        return [
+            ('ollama_generate_overlay', ('clear', 'day'), 'weather-overlay',
+             'WEATHER OVERLAY:\nSky: clear\nAir: dry air\nGround: gravel\nLanternLight: warm glow'),
+            ('ollama_generate_season_block', ('autumn', 'day', 'clear'), 'season-block',
+             'SEASONAL ENVIRONMENT:\nTrees: amber leaves\nGround: fallen leaves\nAir: cool\nDistantDetails: hills'),
+        ]
+
+    def test_weather_and_season_budgets_preserve_options_prompts_and_valid_answers(self):
+        for name, args, step, answer in self.structured_cases():
+            self.app['runner_generate'].return_value = {'done': True, 'done_reason': 'stop', 'response': answer}
+            self.assertEqual(self.app[name](*args), answer)
+            self.assertEqual(self.app['runner_generate'].call_args.args[1], step + '-0')
         self.assertEqual(self.app['runner_generate'].call_count, 2)
         for call in self.app['runner_generate'].call_args_list:
             payload, _ = call.args
-            self.assertEqual(payload['options'], {'temperature': .3, 'top_p': .9, 'num_predict': 200, 'num_ctx': 4096})
+            self.assertEqual(payload['options'], {'temperature': .3, 'top_p': .9, 'num_predict': 4096, 'num_ctx': 16384})
             self.assertEqual(payload['model'], 'qwen3.8:27b')
+            self.assertEqual(payload['prompt'], 'SYSTEM:\nsynthetic prompt\n\nUSER:\nsynthetic prompt\n')
             self.assertFalse(payload['stream'])
             self.assertNotIn('think', payload)
+            self.assertNotIn('think', payload['options'])
+
+    def test_structured_answers_reject_length_limit_even_when_schema_is_valid(self):
+        for name, args, _, answer in self.structured_cases():
+            for metadata in ({'done': True, 'done_reason': 'length'}, {'done': False, 'done_reason': 'stop'}):
+                with self.subTest(function=name, metadata=metadata):
+                    self.app['runner_generate'].reset_mock()
+                    self.app['runner_generate'].return_value = dict(metadata, response=answer)
+                    self.assertEqual(self.app[name](*args), '')
+                    self.assertEqual(self.app['runner_generate'].call_count, 3)
+
+    def test_structured_invalid_or_empty_answers_return_empty_for_deterministic_fallback(self):
+        for name, args, _, answer in self.structured_cases():
+            for response in ('', None, '\n'.join(answer.splitlines()[:2]), 'invalid structure'):
+                with self.subTest(function=name, response=response):
+                    self.app['runner_generate'].return_value = {'done': True, 'done_reason': 'stop', 'response': response}
+                    self.assertEqual(self.app[name](*args, retries=0), '')
+
+    def test_structured_retry_accepts_complete_answer_after_truncation(self):
+        for name, args, step, answer in self.structured_cases():
+            self.app['runner_generate'].reset_mock()
+            self.app['runner_generate'].side_effect = [
+                {'done': True, 'done_reason': 'length', 'response': answer},
+                {'done': True, 'done_reason': 'stop', 'response': answer},
+            ]
+            self.assertEqual(self.app[name](*args), answer)
+            self.assertEqual(self.app['runner_generate'].call_count, 2)
+            self.assertEqual(self.app['runner_generate'].call_args.args[1], step + '-1')
+
+    def test_structured_diagnostics_only_log_completion_metadata(self):
+        for name, args, step, _ in self.structured_cases():
+            self.app['runner_generate'].return_value = {
+                'done': True, 'done_reason': 'length', 'response': 'private final content',
+                'thinking': 'private reasoning content',
+            }
+            self.assertEqual(self.app[name](*args, retries=0), '')
+            self.assertIn(step + ': final_empty=False done=True length_limit=True thinking_present=True',
+                          self.logs.getvalue())
+        self.assertNotIn('private final content', self.logs.getvalue())
+        self.assertNotIn('private reasoning content', self.logs.getvalue())
+
+    def test_existing_deterministic_overlay_fallbacks_are_used_without_rendering(self):
+        source = ast.parse((ROOT / 'app/main.py').read_text(encoding='utf-8'))
+        render = next(n for n in source.body if isinstance(n, ast.FunctionDef) and n.name == 'render_wallpaper')
+        # Execute only the existing fallback branches, never rendering or submitting GPU work.
+        branches = [n for n in render.body if isinstance(n, ast.If) and
+                    ast.unparse(n.test) in {'not overlay.strip()', 'not season_block.strip()'}]
+        self.assertEqual(len(branches), 2)
+        namespace = {'overlay': '', 'season_block': '', 'tod': 'day', 'weather_line': 'clear'}
+        exec(compile(ast.Module(body=branches, type_ignores=[]), str(ROOT / 'app/main.py'), 'exec'), namespace)
+        self.assertIn('Sky: day sky matching clear', namespace['overlay'])
+        self.assertIn('Trees: summer woods with full leafy branches around the scene', namespace['season_block'])
 
 
 if __name__ == '__main__':

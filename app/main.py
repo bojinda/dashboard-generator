@@ -293,7 +293,7 @@ def ollama_daily_quote() -> str:
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 512, "num_ctx": 4096},
+        "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 2048, "num_ctx": 16384},
 }
 
     fallback_quotes = [
@@ -358,7 +358,7 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 1024, "num_ctx": 4096},
+        "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 4096, "num_ctx": 16384},
     }
 
     try:
@@ -910,7 +910,7 @@ def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> st
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 200, "num_ctx": 4096},
+        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 4096, "num_ctx": 16384},
     }
 
     last = ""
@@ -918,7 +918,12 @@ def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> st
         try:
             data = runner_generate(payload, f"weather-overlay-{attempt}")
             txt = (data.get("response") or "").strip()
-            last = txt
+            print(f"weather-overlay: final_empty={not bool(txt)} done={data.get('done') is True} "
+                  f"length_limit={data.get('done_reason') == 'length'} "
+                  f"thinking_present={bool(data.get('thinking'))}", flush=True)
+            last = ""
+            if data.get("done_reason") == "length" or data.get("done") is False:
+                continue
             if overlay_is_valid(txt, tod, weather_line):
                 return txt
         except CoordinationError:
@@ -975,7 +980,7 @@ def ollama_generate_season_block(season: str, tod: str, weather_line: str, retri
         "model": OLLAMA_MODEL,
         "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
         "stream": False,
-        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 200, "num_ctx": 4096},
+        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 4096, "num_ctx": 16384},
     }
 
     last = ""
@@ -983,7 +988,12 @@ def ollama_generate_season_block(season: str, tod: str, weather_line: str, retri
         try:
             data = runner_generate(payload, f"season-block-{attempt}")
             txt = (data.get("response") or "").strip()
-            last = txt
+            print(f"season-block: final_empty={not bool(txt)} done={data.get('done') is True} "
+                  f"length_limit={data.get('done_reason') == 'length'} "
+                  f"thinking_present={bool(data.get('thinking'))}", flush=True)
+            last = ""
+            if data.get("done_reason") == "length" or data.get("done") is False:
+                continue
             if season_is_valid(txt):
                 return txt
         except CoordinationError:
