@@ -17,4 +17,7 @@ __pycache__/
 
 # Generated output
 image_data.bin
-/out/
+/out//release-candidates/
+/review/
+/.staged-on-demand/
+/app/main.py.before-*
