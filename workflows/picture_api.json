@@ -173,19 +173,5 @@
     "_meta": {
       "title": "LayerUtility: Purge VRAM"
     }
-  },
-  "95": {
-    "inputs": {
-      "purge_cache": true,
-      "purge_models": true,
-      "anything": [
-        "40",
-        0
-      ]
-    },
-    "class_type": "LayerUtility: PurgeVRAM",
-    "_meta": {
-      "title": "LayerUtility: Purge VRAM"
-    }
   }
 }
