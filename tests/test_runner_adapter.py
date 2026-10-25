@@ -16,7 +16,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from PIL import Image, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
 
@@ -93,6 +93,9 @@ class ComfyTransport:
     def binary(self, route, params, timeout=5):
         self.views.append(params)
         return self.png, 'image/png'
+    def ack(self, method, route, payload=None, timeout=5):
+        # Match the runner's existing HTTP acknowledgement cleanup contract.
+        self.json(method, route, payload, timeout)
 
 
 def output_contender(root, paths, output):
@@ -510,7 +513,15 @@ class DashboardInterfaceTests(unittest.TestCase):
                 module.render_wallpaper(str(output))
         a, b = Image.open(self.root / 'original.png'), Image.open(self.root / 'wallpaper.png')
         self.assertEqual((b.format, b.mode, b.size), ('PNG', 'RGB', (1600, 1200)))
-        self.assertEqual(a.tobytes(), b.tobytes())
+        # The intentional new footer indicator is the only changed area when
+        # no tasks require shortening. Calendar/picture/title/task pixels match.
+        from recovery_status import RecoveryStatus
+        indicator = self.main.recovery_indicator_layout(ImageDraw.Draw(b), (15, 870, 1585, 1185), RecoveryStatus())
+        changed = ImageChops.difference(a, b).getbbox()
+        left, top, right, bottom = indicator['bounds']
+        self.assertIsNotNone(changed)
+        self.assertTrue(left <= changed[0] <= changed[2] <= right)
+        self.assertTrue(top <= changed[1] <= changed[3] <= bottom)
     def test_epd_soft_failure_and_existing_paths_preserved(self):
         self.main.EPD_PUSH_ENABLED = True
         with (patch.object(self.main, 'render_wallpaper'),

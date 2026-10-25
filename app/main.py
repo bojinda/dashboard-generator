@@ -21,6 +21,7 @@ from config import (
 )
 from clothing import choose_clothing_profile
 from gpu_runner import generate as runner_generate, wallpaper as runner_wallpaper
+from recovery_status import RecoveryStatusReader
 from aihub_gpu_runner.client import CURRENT_OPERATION, CoordinationError, OutputBusy, OutputSlot
 
 
@@ -62,6 +63,39 @@ def load_font(size: int):
     except Exception as e:
         print(f"FONT LOAD FAILED size={size} path={font_path}: {e}", flush=True)
         return ImageFont.load_default()
+
+
+def recovery_indicator_layout(draw, panel, status):
+    font = load_font(19)
+    try:
+        arrow = font.getmask('↻')
+        missing = font.getmask('\u0378')
+        symbol = '↻' if (arrow.size, bytes(arrow)) != (missing.size, bytes(missing)) and arrow.getbbox() else '~'
+    except (UnicodeError, OSError, ValueError):
+        symbol = '~'
+    count = '-' if status.count is None else str(status.count)
+    suffix = ' ?' if status.stale else ' !' if status.operator_required else ''
+    text = f'{symbol} {count}{suffix}'
+    bbox = draw.textbbox((0, 0), text, font=font)
+    right, bottom = panel[2] - 26, panel[3] - 26
+    xy = (right - bbox[2], bottom - bbox[3])
+    return {'text': text, 'font': font, 'xy': xy,
+            'bounds': (xy[0] + bbox[0], xy[1] + bbox[1], right, bottom)}
+
+
+def todo_text_width(y, font, text_x, max_width, indicator):
+    # Only the bottom text row shares space with the indicator. Keep all upper
+    # task/address/quote lines at their existing width and positions.
+    if y + font.getbbox('Ágj')[3] >= indicator['bounds'][1] - 8:
+        return max(0, min(max_width, indicator['bounds'][0] - 16 - text_x))
+    return max_width
+
+
+def draw_recovery_indicator(draw, indicator):
+    draw.text(indicator['xy'], indicator['text'], font=indicator['font'], fill=(96, 96, 96))
+
+
+_RECOVERY_STATUS = RecoveryStatusReader(lambda: _output_slot().store)
 
 def ha_get_state(entity_id: str) -> dict:
     if not HA_TOKEN:
@@ -1394,6 +1428,9 @@ def render_wallpaper(path: str):
 
     y = line_y + 14
     max_w = (tx1 - tx0) - t_inner * 2
+    indicator = recovery_indicator_layout(d, todo, _RECOVERY_STATUS.read())
+    def task_width(row_y):
+        return todo_text_width(row_y, todo_font, tx0 + t_inner, max_w, indicator)
 
     # Try cached AI lines first (cheap)
     with TODO_AI_LOCK:
@@ -1417,13 +1454,13 @@ def render_wallpaper(path: str):
 
         # address line gets no bullet and is indented
             if prev_was_task and looks_like_address_line(ln):
-                txt = clamp_to_width(d, "  " + ln, todo_font, max_w)
+                txt = clamp_to_width(d, "  " + ln, todo_font, task_width(y))
                 d.text((tx0 + t_inner, y), txt, font=todo_font, fill=(14,14,14))
                 prev_was_task = False
             else:
             # quote line has no bullet ONLY if we actually inserted a quote there
                 prefix = "" if (quote_idx == idx) else "• "
-                txt = clamp_to_width(d, f"{prefix}{ln}", todo_font, max_w)
+                txt = clamp_to_width(d, f"{prefix}{ln}", todo_font, task_width(y))
                 d.text((tx0 + t_inner, y), txt, font=todo_font, fill=(14,14,14))
                 prev_was_task = True
 
@@ -1433,7 +1470,7 @@ def render_wallpaper(path: str):
 
     # Reserved line 7
         if ai_summary and y <= ty1 - 30:
-            d.text((tx0 + t_inner, y), clamp_to_width(d, ai_summary, todo_font, max_w), font=todo_font, fill=(80,80,80))
+            d.text((tx0 + t_inner, y), clamp_to_width(d, ai_summary, todo_font, task_width(y)), font=todo_font, fill=(80,80,80))
 
     else:
         # Fallback to raw (your current behavior)
@@ -1460,14 +1497,17 @@ def render_wallpaper(path: str):
 
         for text in shown:
             line = f"• {text}"
-            wrapped = wrap_text(d, line, todo_font, max_w)
+            wrapped = wrap_text(d, line, todo_font, task_width(y))
+            wrapped = [clamp_to_width(d, text, todo_font, task_width(y)) for text in wrapped[:1]]
             draw_wrapped_lines(d, tx0 + t_inner, y, wrapped, todo_font, (14,14,14), max_lines=1, line_gap=6)
             y += (todo_font.size + 6) + 10
             if y > ty1 - 40:
                 break
 
         if remaining > 0 and y <= ty1 - 30:
-            d.text((tx0 + t_inner, y), f"+{remaining} more…", font=todo_font, fill=(80,80,80))
+            d.text((tx0 + t_inner, y), clamp_to_width(d, f"+{remaining} more…", todo_font, task_width(y)), font=todo_font, fill=(80,80,80))
+
+    draw_recovery_indicator(d, indicator)
 
     # -------- Save Image --------
     img.save(path, "PNG")
