@@ -120,6 +120,7 @@ def rendering_functions(status=RecoveryStatus(3, False, False), ai=True):
     ns = {'Image': Image, 'ImageDraw': ImageDraw, 'ImageFont': ImageFont, 'datetime': datetime,
           'timedelta': timedelta, 're': re, 'TODO_AI_LOCK': threading.Lock(), 'BASE_IMAGE_PROMPT': 'synthetic',
           'WEATHER_ENTITY': 'weather.synthetic', 'CALENDAR_ENTITY': 'calendar.synthetic', 'TODO_ENTITY': 'todo.synthetic',
+          'stage_event': lambda *a, **kw: None, 'failure_reason': lambda *a, **kw: 'invalid_model_output',
           'CoordinationError': RuntimeError, '_RECOVERY_STATUS': SimpleNamespace(read=Mock(return_value=status)),
           'toronto_day': lambda: '2026-10-26', 'todo_display_rows': lambda rows: (rows, None),
           'TODO_AI_CACHE': {'day': '2026-10-26', 'lines': ['Synthetic task ' + str(i) for i in range(6)] if ai else [],

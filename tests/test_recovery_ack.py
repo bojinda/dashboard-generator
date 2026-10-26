@@ -89,6 +89,24 @@ class AcknowledgmentTests(unittest.TestCase):
         self.assertIsNone(self.ack.displayed(inventory(), 2))
         with self.assertRaises(ValueError): self.ack.acknowledge()
 
+    def test_actual_runner_inventory_interoperates_without_any_journal_mutation(self):
+        from aihub_gpu_runner.recovery_summary import summarize_recovery
+        state = {'scope': 'before', 'automatic_recovery': {'a': {
+            'kind': 'wallpaper', 'phase': 'operator_required', 'created_at': (NOW - timedelta(days=6)).isoformat(),
+            'identity': {'job_id': 'old-job', 'lease_id': 'old-lease', 'target': 'wallpaper'}}}}
+        first = summarize_recovery(state, at=NOW, include_incidents=True)
+        self.transport.request.return_value = 200, 'application/json', encode(first)
+        self.assertTrue(self.ack.acknowledge()['operator_required'])
+        state['scope'] = 'after'
+        self.assertEqual(self.ack.displayed(summarize_recovery(state, at=NOW, include_incidents=True), 1), 0)
+        self.now[0] = NOW + timedelta(days=2)
+        state['automatic_recovery']['b'] = {'kind': 'wallpaper', 'phase': 'released',
+            'created_at': self.now[0].isoformat(),
+            'identity': {'job_id': 'new-job', 'lease_id': 'new-lease', 'target': 'wallpaper'}}
+        later = summarize_recovery(state, at=self.now[0], include_incidents=True)
+        self.assertEqual(self.ack.displayed(later, later['incidents_7d']), 1)
+        self.assertEqual(state['automatic_recovery']['a']['phase'], 'operator_required')
+
 
 class ProtectedEndpointTests(unittest.TestCase):
     def setUp(self):

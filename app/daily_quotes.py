@@ -81,7 +81,7 @@ class DailyQuotes:
                     return self.fallback('runner_uncertain')
             raw = data.get('response') if isinstance(data, dict) else None
             valid = (isinstance(raw, str) and '\n' not in raw.strip() and '\r' not in raw.strip() and
-                     data.get('done') is True and data.get('done_reason') != 'length' and validator(raw.strip()))
+                     data.get('done') is True and data.get('done_reason') in (None, 'stop') and validator(raw.strip()))
             state['pending'] = None
             if valid:
                 state['successful'].append({'day': pending['day'], 'quote': raw.strip()})

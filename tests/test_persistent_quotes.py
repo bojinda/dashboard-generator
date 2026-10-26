@@ -42,6 +42,7 @@ class QuoteTests(unittest.TestCase):
     def test_invalid_results_fallback_then_next_intent_uses_new_identity(self):
         for data in ({'done': True, 'response': ''}, {'done': False, 'response': QUOTE},
                      {'done': True, 'done_reason': 'length', 'response': QUOTE},
+                     {'done': True, 'done_reason': 'error', 'response': QUOTE},
                      {'done': True, 'response': QUOTE + '\nextra'}, {'response': QUOTE}):
             with self.subTest(data=data):
                 self.client.run.return_value = data

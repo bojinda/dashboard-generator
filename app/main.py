@@ -25,6 +25,8 @@ from recovery_status import RecoveryStatusReader, environment_transport
 from recovery_ack import RecoveryAcknowledgment
 import hmac
 from daily_quotes import DailyQuotes, toronto_day
+from pipeline_status import stage_event, pipeline_summary, abort_pipeline, failure_reason, delivery_reason
+from aihub_gpu_runner.client import KnownJobFailure
 from aihub_gpu_runner.client import CURRENT_OPERATION, CoordinationError, OutputBusy, OutputSlot
 
 
@@ -286,7 +288,7 @@ def quote_is_usable(s: str) -> bool:
         return False
 
     # Too long / too short
-    if len(s) < 20 or len(s) > 80:
+    if len(s) < 20 or len(s) > 80 or s[-1] not in '.!?':
         return False
 
     return True
@@ -340,6 +342,7 @@ def ollama_daily_quote() -> str:
                 "stream": False,
                 "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 2048, "num_ctx": 16384}}
     result = _daily_quotes().get(payload, quote_is_usable)
+    stage_event('quote', 'uncertain' if result['reason'] == 'runner_uncertain' else result['status'], result['reason'])
     return result['quote']
 
 def todo_display_rows(lines):
@@ -354,6 +357,7 @@ def todo_display_rows(lines):
 
 
 def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
+    stage_event('todo', 'running')
     tasks = []
     for it in items_open_sorted:
         summary = _norm_ws(it.get("summary") or it.get("item") or "")
@@ -379,16 +383,18 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
         print(f"todo-format: final_empty={not bool(out)} done={data.get('done') is True} "
               f"length_limit={data.get('done_reason') == 'length'} "
               f"thinking_present={bool(data.get('thinking'))}", flush=True)
-        if data.get("done_reason") == "length":
+        if data.get("done") is not True or data.get("done_reason") == "length":
             raise ValueError("incomplete_todo_generation")
         lines = [ln.rstrip() for ln in out.splitlines()]
         if not out or (tasks and not any(
                 not is_effectively_blank_line(ln) and
                 not (ln.lstrip().startswith("+") and "more" in ln.lower()) for ln in lines[:6])):
             raise ValueError("empty_final_task_response")
-    except CoordinationError:
+    except CoordinationError as exc:
+        stage_event('todo', 'uncertain', 'runner_uncertain', exc)
         raise
     except Exception as e:
+        stage_event('todo', 'fallback', failure_reason(e, 'invalid_model_output'), e)
         print(f"todo formatting failed; using Home Assistant tasks ({type(e).__name__})", flush=True)
         raw_lines = []
         for t in tasks[:6]:
@@ -407,6 +413,7 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
     elif len(lines) > 7:
         lines = lines[:7]
 
+    stage_event('todo', 'success')
     return {"lines": lines[:6], "summary_line": lines[6]}
 
 def ha_todo_get_items(entity_id: str):
@@ -807,29 +814,12 @@ def group_events_by_day(events: list[dict]) -> list[tuple]:
     return [(d, buckets[d]) for d in days_sorted]
 
 def push_existing_wallpaper_to_epd() -> dict:
-    """
-    Re-use the current /out/wallpaper.png, regenerate the EPD bin,
-    and optionally push it to the display.
-    Fast path for tuning epdoptimize without calling HA/Ollama/Comfy.
-    """
     if not os.path.exists(OUT_PATH):
-        raise FileNotFoundError(f"Wallpaper not found: {OUT_PATH}")
-
-    bin_path = os.path.join(os.path.dirname(OUT_PATH), "image_data.bin")
-    n = generate_epaper_bin_epdoptimize(OUT_PATH, bin_path)
-
-    pushed = False
-    if EPD_PUSH_ENABLED:
-        push_bin_to_epd(bin_path)
-        pushed = True
-
-    return {
-        "ok": True,
-        "out": OUT_PATH,
-        "bin": bin_path,
-        "bin_bytes": n,
-        "epd_push": "ok" if pushed else "disabled",
-    }
+        raise FileNotFoundError('wallpaper_not_found')
+    stage_event('composition', 'cached')
+    response = _convert_and_deliver(OUT_PATH)
+    response['out'] = OUT_PATH
+    return response
 
 def format_weather_for_display(state_obj: dict) -> str:
     state = state_obj.get("state", "unknown")
@@ -913,6 +903,7 @@ def overlay_is_valid(text: str, tod: str, weather_line: str = "") -> bool:
     return True
 
 def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> str:
+    stage_event('weather', 'running')
 
     system = build_overlay_system_prompt(tod)
     user = build_overlay_user_prompt(weather_line)
@@ -934,20 +925,21 @@ def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> st
                   f"length_limit={data.get('done_reason') == 'length'} "
                   f"thinking_present={bool(data.get('thinking'))}", flush=True)
             last = ""
-            if data.get("done_reason") == "length" or data.get("done") is False:
+            if data.get("done_reason") == "length" or data.get("done") is not True:
                 continue
             if overlay_is_valid(txt, tod, weather_line):
+                stage_event('weather', 'success')
                 return txt
-        except CoordinationError:
+        except CoordinationError as exc:
+            stage_event('weather', 'uncertain', 'runner_uncertain', exc)
             raise
-        except Exception as e:
-            last = (
-                "WEATHER OVERLAY:\n"
-                "Sky: overlay error while contacting ollama service\n"
-                f"Air: {str(e)[:80]}\n"
-                "Ground: check ollama connectivity and model availability\n"
-                "LanternLight: check ollama logs for generation failures"
-            )
+        except KnownJobFailure as exc:
+            stage_event('weather', 'fallback', 'runner_failed', exc)
+            return ''
+        except Exception as exc:
+            stage_event('weather', 'fallback', 'service_unavailable', exc)
+            return ''
+    stage_event('weather', 'fallback', 'invalid_model_output')
     return last.strip()
 
 _SEASON_RE = re.compile(
@@ -981,6 +973,7 @@ def scrub_precip_words(s: str) -> str:
     )
 
 def ollama_generate_season_block(season: str, tod: str, weather_line: str, retries: int = 2) -> str:
+    stage_event('season', 'running')
 
     system = build_season_system_prompt(tod)
 
@@ -1004,20 +997,21 @@ def ollama_generate_season_block(season: str, tod: str, weather_line: str, retri
                   f"length_limit={data.get('done_reason') == 'length'} "
                   f"thinking_present={bool(data.get('thinking'))}", flush=True)
             last = ""
-            if data.get("done_reason") == "length" or data.get("done") is False:
+            if data.get("done_reason") == "length" or data.get("done") is not True:
                 continue
             if season_is_valid(txt):
+                stage_event('season', 'success')
                 return txt
-        except CoordinationError:
+        except CoordinationError as exc:
+            stage_event('season', 'uncertain', 'runner_uncertain', exc)
             raise
-        except Exception as e:
-            last = (
-                "SEASONAL ENVIRONMENT:\n"
-                "Trees: season block error contacting ollama service\n"
-                f"Ground: {str(e)[:80]}\n"
-                "Air: check ollama connectivity and model availability\n"
-                "DistantDetails: check ollama logs for generation failures"
-            )
+        except KnownJobFailure as exc:
+            stage_event('season', 'fallback', 'runner_failed', exc)
+            return ''
+        except Exception as exc:
+            stage_event('season', 'fallback', 'service_unavailable', exc)
+            return ''
+    stage_event('season', 'fallback', 'invalid_model_output')
     return last.strip()
 
 def build_clothing_block(profile: dict) -> str:
@@ -1065,16 +1059,6 @@ def comfy_render_image(final_prompt: str, width: int, height: int, timeout_s: in
     # 1) set prompt + input image
     workflow["88"]["inputs"]["value"] = final_prompt
     workflow["9"]["inputs"]["image"] = COMFY_INPUT_IMAGE
-    print("========== DASHBOARD FINAL PROMPT ==========", flush=True)
-    print(final_prompt[:3000], flush=True)
-    print("========== WORKFLOW NODE 88 ==========", flush=True)
-    print(workflow["88"]["inputs"], flush=True)
-    try:
-        print("========== WORKFLOW NODE 7 SEED ==========", flush=True)
-        print(workflow["7"]["inputs"].get("seed"), flush=True)
-    except Exception as e:
-        print(f"Could not print seed: {e}", flush=True)
-
     # 2) set target size on node 40 (BEFORE queueing!)
     workflow["40"]["inputs"]["aspect_ratio"] = "custom"
     workflow["40"]["inputs"]["proportional_width"] = int(width)
@@ -1187,6 +1171,7 @@ def render_wallpaper(path: str):
 #    draw_multiline(d, (W // 2 - 700, H // 2 + 80), overlay, font=small_font, fill=(205, 205, 205), line_spacing=8)
 
     picture = None
+    stage_event('wallpaper', 'running')
     try:
     # inner area
         inner_pad = 16
@@ -1198,11 +1183,16 @@ def render_wallpaper(path: str):
         box_w, box_h = (x1 - x0), (y1 - y0)
 
         picture = comfy_render_image(final_prompt, width=box_w, height=box_h)
-    except CoordinationError:
+        if not isinstance(picture, Image.Image):
+            raise ValueError('invalid_wallpaper_image')
+        stage_event('wallpaper', 'success')
+    except CoordinationError as exc:
+        stage_event('wallpaper', 'uncertain', 'runner_uncertain', exc)
         raise
-    except Exception as e:
-        err = f"Comfy error:\n{str(e)[:220]}"
-        draw_multiline(d, (pic[0] + 28, pic[1] + 28), err, font=small_font, fill=(230, 180, 180))
+    except Exception as exc:
+        stage_event('wallpaper', 'fallback', failure_reason(exc, 'invalid_model_output'), exc)
+        draw_multiline(d, (pic[0] + 26, pic[1] + 26), 'Wallpaper generation failed. See render status.',
+                       font=load_font(24), fill=(180, 30, 30), line_spacing=8)
 
     if picture:
     # picture should already be exact size; paste directly
@@ -1417,6 +1407,8 @@ def render_wallpaper(path: str):
         quote_idx = TODO_AI_CACHE.get("quote_idx")
 
     if ai_lines:
+        stage_event('todo', 'cached' if TODO_AI_CACHE.get('hash') else 'fallback',
+                    None if TODO_AI_CACHE.get('hash') else 'invalid_model_output')
     # Quote appears on visible line 5 (idx 4) only when we inserted it:
     # buffer line (idx 3) blank + idx 4 non-empty
         ai_lines, quote_idx = todo_display_rows(ai_lines)
@@ -1514,20 +1506,31 @@ def _reserve_output(kind, request_id=None):
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid X-Request-ID")
         except CoordinationError as exc:
-            raise HTTPException(status_code=503, detail=str(exc))
+            raise HTTPException(status_code=503, detail='output_operation_unavailable_no_replay')
         if not operation.cached:
             JOB_RUNNING = True
             LAST_JOB = _operation_status(operation.record)
         return operation
 
 def _operation_status(record):
-    return {key: record[key] for key in ("status", "started", "finished", "error", "request_id") if key in record}
+    result = {key: record[key] for key in ('status', 'started', 'finished', 'request_id') if key in record}
+    result['error'] = 'operation_failed' if record.get('error') else None
+    if record.get('details', {}).get('pipeline'):
+        result.update(pipeline_summary(record, failed=record.get('status') == 'error'))
+    return result
 
 def _finish_output(operation, response=None, error=None):
     global JOB_RUNNING, LAST_JOB
     try:
+        if error is not None:
+            error = abort_pipeline(operation, error)
+        if response is not None:
+            response.update(pipeline_summary(dict(operation.record, status='ok')))
         operation.finish(response, error)
     finally:
+        if operation.lock is not None:
+            operation.lock.close()
+            operation.lock = None
         with JOB_LOCK:
             JOB_RUNNING = False
             LAST_JOB = _operation_status(operation.record)
@@ -1535,19 +1538,11 @@ def _finish_output(operation, response=None, error=None):
 def _run_render_job(operation):
     token = CURRENT_OPERATION.set(operation)
     try:
-        os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
-        render_wallpaper(OUT_PATH)
-        bin_path = os.path.join(os.path.dirname(OUT_PATH), "image_data.bin")
-        n = generate_epaper_bin_epdoptimize(OUT_PATH, bin_path)
-        try:
-            push_bin_to_epd(bin_path)
-        except Exception as e:
-            if EPD_PUSH_FAIL_HARD:
-                raise
-            print(f"EPD push failed (soft): {e}")
-        _finish_output(operation, {"ok": True, "queued": False, "status": "ok"})
-    except Exception as e:
-        _finish_output(operation, error=str(e))
+        response = _render_body()
+        response.update(queued=False, status='ok')
+        _finish_output(operation, response)
+    except Exception as exc:
+        _finish_output(operation, error=exc)
     finally:
         CURRENT_OPERATION.reset(token)
 
@@ -1622,7 +1617,7 @@ def render_test(request_id: str | None = Header(None, alias="X-Request-ID")):
         _finish_output(operation, response)
         return response
     except Exception as exc:
-        _finish_output(operation, error=str(exc))
+        _finish_output(operation, error=exc)
         raise
     finally:
         CURRENT_OPERATION.reset(token)
@@ -1638,7 +1633,7 @@ def _render_test_body():
     try:
         return push_existing_wallpaper_to_epd()
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="dashboard_operation_failed") from None
 
 @app.post("/todo_generate_today")
 def todo_generate_today():
@@ -1666,7 +1661,7 @@ def todo_generate_today():
             "tasks": tasks,
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="dashboard_operation_failed") from None
 
 @app.post("/render_async")
 def render_async(background_tasks: BackgroundTasks, request_id: str | None = Header(None, alias="X-Request-ID")):
@@ -1678,9 +1673,9 @@ def render_async(background_tasks: BackgroundTasks, request_id: str | None = Hea
     try:
         background_tasks.add_task(_run_render_job, operation)
     except Exception as exc:
-        _finish_output(operation, error=str(exc))
+        _finish_output(operation, error=exc)
         raise
-    return {"ok": True, "queued": True}
+    return {"ok": True, "queued": True, "request_id": operation.request_id}
 
 
 @app.post("/render_test_path")
@@ -1696,41 +1691,33 @@ def render_test_path(path: str, request_id: str | None = Header(None, alias="X-R
         _finish_output(operation, response)
         return response
     except Exception as exc:
-        _finish_output(operation, error=str(exc))
+        _finish_output(operation, error=exc)
         raise
     finally:
         CURRENT_OPERATION.reset(token)
 
 def _render_test_path_body(path: str):
-    """
-    Convert and push any existing PNG on disk.
-    Example:
-      /render_test_path?path=/out/wallpaper.png
-    """
     try:
         if not os.path.exists(path):
-            raise FileNotFoundError(f"Image not found: {path}")
-
-        bin_path = os.path.join(os.path.dirname(OUT_PATH), "image_data.bin")
-        n = generate_epaper_bin_epdoptimize(path, bin_path)
-
-        if EPD_PUSH_ENABLED:
-            push_bin_to_epd(bin_path)
-
-        return {
-            "ok": True,
-            "source": path,
-            "bin": bin_path,
-            "bin_bytes": n,
-            "epd_push": "ok" if EPD_PUSH_ENABLED else "disabled",
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            raise FileNotFoundError('wallpaper_not_found')
+        stage_event('composition', 'cached')
+        response = _convert_and_deliver(path)
+        response['source'] = path
+        return response
+    except Exception:
+        raise HTTPException(status_code=500, detail='dashboard_operation_failed') from None
 
 @app.get("/render_status")
-def render_status():
+def render_status(request_id: str | None = None):
     with JOB_LOCK:
-        last = _operation_status(_output_slot().status())
+        try:
+            record = (_output_slot().operation_status(request_id) if request_id is not None
+                      else _output_slot().status())
+        except ValueError:
+            raise HTTPException(status_code=400, detail='invalid_request_id') from None
+        if record is None:
+            raise HTTPException(status_code=404, detail='operation_not_found')
+        last = _operation_status(record)
         return {"ok": True, "running": last["status"] == "running", "last": last}
 
 @app.post("/render")
@@ -1746,49 +1733,47 @@ def render(request_id: str | None = Header(None, alias="X-Request-ID")):
         _finish_output(operation, response)
         return response
     except Exception as exc:
-        _finish_output(operation, error=str(exc))
+        _finish_output(operation, error=exc)
         raise
     finally:
         CURRENT_OPERATION.reset(token)
 
 def _render_body():
     os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+    stage_event('composition', 'running')
     render_wallpaper(OUT_PATH)
+    stage_event('composition', 'success')
+    response = _convert_and_deliver(OUT_PATH)
+    response.update(out=OUT_PATH, weather_entity=WEATHER_ENTITY, ollama_model=OLLAMA_MODEL)
+    return response
 
-    bin_path = os.path.join(os.path.dirname(OUT_PATH), "image_data.bin")
-    n = generate_epaper_bin_epdoptimize(OUT_PATH, bin_path)
 
-    # optional push
+def _convert_and_deliver(png_path):
+    bin_path = os.path.join(os.path.dirname(OUT_PATH), 'image_data.bin')
+    stage_event('conversion', 'running')
+    n = generate_epaper_bin_epdoptimize(png_path, bin_path)
+    if n != BIN_BYTES_EXPECTED:
+        stage_event('conversion', 'failed', 'conversion_failed')
+        raise HTTPException(status_code=500, detail='binary_conversion_failed')
+    stage_event('conversion', 'success')
+    pushed, push_error = 'disabled', None
     if EPD_PUSH_ENABLED:
+        stage_event('delivery', 'running')
         try:
             push_bin_to_epd(bin_path)
-        except Exception as e:
+            pushed = 'ok'
+            stage_event('delivery', 'success')
+        except Exception as exc:
+            push_error = delivery_reason(exc)
+            stage_event('delivery', 'failed', push_error)
             if EPD_PUSH_FAIL_HARD:
-                raise HTTPException(status_code=500, detail=f"EPD push failed: {e}")
-            # soft: include it in response
-            return {
-                "ok": True,
-                "out": OUT_PATH,
-                "bin": bin_path,
-                "bin_bytes": n,
-                "epd_push": "failed_soft",
-                "epd_push_error": str(e),
-                "weather_entity": WEATHER_ENTITY,
-                "ollama_model": OLLAMA_MODEL,
-            }
-
-    if n != BIN_BYTES_EXPECTED:
-        raise HTTPException(status_code=500, detail=f"bin size wrong: {n} bytes (expected {BIN_BYTES_EXPECTED})")
-
-    return {
-        "ok": True,
-        "out": OUT_PATH,
-        "bin": bin_path,
-        "bin_bytes": n,
-        "epd_push": "ok" if EPD_PUSH_ENABLED else "disabled",
-        "weather_entity": WEATHER_ENTITY,
-        "ollama_model": OLLAMA_MODEL,
-    }
+                raise HTTPException(status_code=500, detail='EPD delivery failed') from None
+            pushed = 'failed_soft'
+    else:
+        stage_event('delivery', 'skipped', 'delivery_disabled')
+    response = {'ok': True, 'bin': bin_path, 'bin_bytes': n, 'epd_push': pushed}
+    if push_error: response['epd_push_error'] = push_error
+    return response
 
 @app.get("/health")
 def health():

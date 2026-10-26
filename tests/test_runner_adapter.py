@@ -356,7 +356,7 @@ class DashboardInterfaceTests(unittest.TestCase):
         self.temp.cleanup()
     def test_async_trigger_reserves_before_background_task_is_started(self):
         tasks = BackgroundTasks()
-        self.assertEqual(self.main.render_async(tasks, 'first-async'), {'ok': True, 'queued': True})
+        self.assertEqual(self.main.render_async(tasks, 'first-async'), {'ok': True, 'queued': True, 'request_id': 'first-async'})
         self.assertEqual(self.main.render_async(BackgroundTasks(), 'second-async'),
                          {'ok': True, 'queued': False, 'status': 'busy'})
         self.assertEqual(self.main.render('sync-while-async')['status'], 'busy')
@@ -384,7 +384,8 @@ class DashboardInterfaceTests(unittest.TestCase):
             asyncio.run(tasks())
             repeat = BackgroundTasks()
             response = self.main.render_async(repeat, 'stable-async-id')
-            self.assertEqual(response, {'ok': True, 'queued': False, 'status': 'ok'})
+            self.assertEqual({k: response[k] for k in ('ok', 'queued', 'status')}, {'ok': True, 'queued': False, 'status': 'ok'})
+            self.assertEqual(response['pipeline_status'], 'success')
             self.assertEqual(repeat.tasks, [])
             self.assertEqual(compose.call_count, 1)
     def test_ha_routes_and_normal_sync_response_preserved(self):
@@ -395,7 +396,7 @@ class DashboardInterfaceTests(unittest.TestCase):
             response = client.post('/render', headers={'X-Request-ID': 'ha-render'})
             self.assertEqual(response.status_code, 200)
             value = response.json()
-            self.assertEqual(value, {'ok': True, 'out': self.main.OUT_PATH,
+            self.assertEqual({k: value[k] for k in ('ok','out','bin','bin_bytes','epd_push','weather_entity','ollama_model')}, {'ok': True, 'out': self.main.OUT_PATH,
                 'bin': str(self.root / 'image_data.bin'), 'bin_bytes': 960000,
                 'epd_push': 'disabled', 'weather_entity': self.main.WEATHER_ENTITY, 'ollama_model': 'synthetic'})
             self.assertEqual(client.post('/render', headers={'X-Request-ID': 'ha-render'}).json(), value)
@@ -542,7 +543,7 @@ class DashboardInterfaceTests(unittest.TestCase):
               patch.object(self.main, 'push_bin_to_epd', side_effect=RuntimeError('synthetic EPD unavailable'))):
             response = TestClient(self.main.app).post('/render', headers={'X-Request-ID': 'hard-epd'})
         self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.json()['detail'], 'EPD push failed: synthetic EPD unavailable')
+        self.assertEqual(response.json()['detail'], 'EPD delivery failed')
         self.assertEqual(self.main.render_status()['last']['status'], 'error')
 
 if __name__ == '__main__':

@@ -20,6 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 from daily_quotes import DailyQuotes, toronto_day
 from aihub_gpu_runner.core import AtomicStore
+from pipeline_status import stage_event, failure_reason
+from aihub_gpu_runner.client import KnownJobFailure
 
 
 class SyntheticCoordinationError(Exception):
@@ -49,6 +51,7 @@ def text_functions():
         'QUOTE_LOCK': threading.Lock(), 'TODO_AI_LOCK': threading.Lock(),
         'QUOTE_CACHE': {'day': None, 'quote': '', 'recent': []},
         'TODO_AI_CACHE': {'hash': None, 'day': None, 'lines': [], 'summary_line': '', 'ts': 0},
+        'stage_event': stage_event, 'failure_reason': failure_reason, 'KnownJobFailure': KnownJobFailure,
         'runner_generate': Mock(return_value={}),
         '_todo_items_open_sorted': Mock(side_effect=AssertionError('live HA forbidden')),
     }
