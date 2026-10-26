@@ -154,7 +154,7 @@ class GPU1ConditioningTests(unittest.TestCase):
         original = json.loads((ROOT / 'workflows/picture_api.json').read_text(encoding='utf-8'))
         variant = json.loads((ROOT / 'workflows/picture_api_gpu1_conditioning.json').read_text(encoding='utf-8'))
         cpu = dict(original)
-        cpu.pop('95')  # Deployed CPU workflow already removed this unused node.
+        cpu.pop('95', None)  # Production baseline may already omit this unused node.
         self.assertEqual(set(variant), set(cpu))
         self.assertEqual(len(variant), 11)
         self.assertEqual({k: v for k, v in cpu.items() if k != '3'},

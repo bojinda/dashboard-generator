@@ -437,7 +437,7 @@ class DashboardInterfaceTests(unittest.TestCase):
                 result = dashboard.render('full-adapter-operation')
                 self.assertTrue(result['ok'])
                 self.assertEqual(dashboard.render('full-adapter-operation'), result)
-            self.assertEqual((ollama.generations, ollama.unloads, comfy.submissions, comfy.frees), (2, 2, 1, 1))
+            self.assertEqual((ollama.generations, ollama.unloads, comfy.submissions, comfy.frees), (3, 3, 1, 1))  # Weather, season and independently owned daily quote.
             self.assertEqual(admission.snapshot()['owners'], {})
             image = Image.open(dashboard.OUT_PATH)
             self.assertEqual((image.format, image.mode, image.size), ('PNG', 'RGB', (1600, 1200)))
@@ -449,8 +449,12 @@ class DashboardInterfaceTests(unittest.TestCase):
             values.append((payload, step))
             if step == 'todo-format':
                 return {'response': 'one\ntwo\n\n\n\n\n+0 more — done'}
-            return {'response': 'A quiet day still counts as progress.'}
-        with patch.object(self.main, 'runner_generate', side_effect=generate):
+            return {'done': True, 'response': 'A quiet day still counts as progress.'}
+        from daily_quotes import DailyQuotes
+        from types import SimpleNamespace
+        ledger = DailyQuotes(lambda: self.main._output_slot().store,
+            lambda: SimpleNamespace(run=lambda rid, target, op, payload: generate(payload, 'daily-quote')))
+        with patch.object(self.main, 'runner_generate', side_effect=generate), patch.object(self.main, '_daily_quotes', return_value=ledger):
             self.main.ollama_format_todo([{'summary': 'synthetic task'}])
             self.assertEqual(self.main.ollama_daily_quote(), 'A quiet day still counts as progress.')
         self.assertEqual([step for _, step in values][0], 'todo-format')
@@ -509,7 +513,7 @@ class DashboardInterfaceTests(unittest.TestCase):
                  patch.object(module, 'ollama_generate_season_block', return_value='synthetic season'),
                  patch.object(module, 'comfy_render_image', return_value=image),
                  patch.object(module, 'ha_calendar_get_events_range', return_value={}),
-                 patch.object(module, 'ha_todo_get_items', return_value=[])):
+                 patch.object(module, 'ha_todo_get_items', return_value=[{'summary': 'Task ' + str(i)} for i in range(6)])):
                 module.render_wallpaper(str(output))
         a, b = Image.open(self.root / 'original.png'), Image.open(self.root / 'wallpaper.png')
         self.assertEqual((b.format, b.mode, b.size), ('PNG', 'RGB', (1600, 1200)))

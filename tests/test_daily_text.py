@@ -10,10 +10,16 @@ import re
 import threading
 import time
 import unittest
+import tempfile
+import sys
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'app'))
+from daily_quotes import DailyQuotes, toronto_day
+from aihub_gpu_runner.core import AtomicStore
 
 
 class SyntheticCoordinationError(Exception):
@@ -23,7 +29,7 @@ class SyntheticCoordinationError(Exception):
 def text_functions():
     names = {
         '_norm_ws', 'is_effectively_blank_line', '_stable_todo_hash',
-        'clean_quote_text', 'quote_is_usable', 'ollama_daily_quote',
+        'clean_quote_text', 'quote_is_usable', 'ollama_daily_quote', 'todo_display_rows',
         'ollama_format_todo', 'todo_ai_refresh', 'ollama_generate_overlay',
         'ollama_generate_season_block', 'scrub_precip_words',
         'overlay_is_valid', 'season_is_valid',
@@ -49,6 +55,11 @@ def text_functions():
     for name in ('quote_system', 'quote_user', 'todo_system', 'todo_user',
                  'overlay_system', 'overlay_user', 'season_system', 'season_user'):
         namespace['build_' + name + '_prompt'] = Mock(return_value='synthetic prompt')
+    temporary = tempfile.TemporaryDirectory()
+    namespace['_temporary'] = temporary
+    client = SimpleNamespace(run=lambda rid, target, op, payload: namespace['runner_generate'](payload, 'daily-quote'), status=Mock(side_effect=OSError('uncertain')))
+    ledger = DailyQuotes(lambda: AtomicStore(temporary.name), lambda: client)
+    namespace.update(_daily_quotes=lambda: ledger, toronto_day=toronto_day)
     exec(compile(ast.Module(body=functions, type_ignores=[]), str(ROOT / 'app/main.py'), 'exec'), namespace)
     return namespace
 
@@ -56,6 +67,7 @@ def text_functions():
 class DailyTextTests(unittest.TestCase):
     def setUp(self):
         self.app = text_functions()
+        self.addCleanup(self.app['_temporary'].cleanup)
         self.items = [
             {'summary': 'Task A', 'description': 'Original detail A', 'due': '2026-10-22'},
             {'summary': 'Task B', 'description': 'Original detail B'},
@@ -140,24 +152,23 @@ class DailyTextTests(unittest.TestCase):
         self.app['runner_generate'].assert_called_once()
         self.assertIn('final_empty=False done=True length_limit=True', self.logs.getvalue())
 
-    def test_empty_quote_keeps_same_fallback_as_exception_and_caches_it(self):
+    def test_empty_quote_fallback_is_not_cached_and_next_intent_is_allowed(self):
         self.app['runner_generate'].return_value = {'done': True, 'done_reason': 'length', 'response': ''}
         fallback = self.app['ollama_daily_quote']()
         self.assertTrue(fallback.strip())
         self.assertEqual(self.app['ollama_daily_quote'](), fallback)
-        self.app['runner_generate'].assert_called_once()  # No added retries on an empty answer.
-        self.app['QUOTE_CACHE'].update(day=None, quote='', recent=[])
+        self.assertEqual(self.app['runner_generate'].call_count, 2)
         self.app['runner_generate'].side_effect = RuntimeError('synthetic unavailable')
         self.assertEqual(self.app['ollama_daily_quote'](), fallback)
 
-    def test_unusable_nonempty_quotes_keep_existing_three_attempt_fallback(self):
+    def test_unusable_nonempty_quote_does_not_automatically_retry(self):
         self.app['runner_generate'].return_value = {'response': 'sorry'}
         self.assertTrue(self.app['ollama_daily_quote']().strip())
-        self.assertEqual(self.app['runner_generate'].call_count, 3)
+        self.assertEqual(self.app['runner_generate'].call_count, 1)
 
     def test_coordination_failures_still_propagate(self):
         self.app['runner_generate'].side_effect = SyntheticCoordinationError('held')
-        for name, args in [('ollama_format_todo', (self.items,)), ('ollama_daily_quote', ()),
+        for name, args in [('ollama_format_todo', (self.items,)),
                            ('ollama_generate_overlay', ('clear', 'day')),
                            ('ollama_generate_season_block', ('autumn', 'day', 'clear'))]:
             with self.subTest(function=name), self.assertRaises(SyntheticCoordinationError):

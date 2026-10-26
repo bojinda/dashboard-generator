@@ -22,6 +22,7 @@ from config import (
 from clothing import choose_clothing_profile
 from gpu_runner import generate as runner_generate, wallpaper as runner_wallpaper
 from recovery_status import RecoveryStatusReader
+from daily_quotes import DailyQuotes, toronto_day
 from aihub_gpu_runner.client import CURRENT_OPERATION, CoordinationError, OutputBusy, OutputSlot
 
 
@@ -192,12 +193,6 @@ TODO_AI_CACHE = {
     "ts": 0,
 }
 
-QUOTE_LOCK = threading.Lock()
-QUOTE_CACHE = {
-    "day": None,
-    "quote": "",
-    "recent": [],   # keep last few quotes
-}
 
 TODO_AI_LOCK = threading.Lock()
 
@@ -307,73 +302,35 @@ def _todo_items_open_sorted(entity_id: str) -> list[dict]:
     return open_items
 
 
+_DAILY_QUOTES = None
+
+def _daily_quotes():
+    global _DAILY_QUOTES
+    if _DAILY_QUOTES is None:
+        _DAILY_QUOTES = DailyQuotes(lambda: _output_slot().store)
+    return _DAILY_QUOTES
+
 def ollama_daily_quote() -> str:
-    """
-    Generate 1 quote per day via Ollama and cache it.
-    Avoid repeating recent quotes.
-    """
-    today = date.today().isoformat()
-    with QUOTE_LOCK:
-        if QUOTE_CACHE["day"] == today and QUOTE_CACHE["quote"]:
-            print(f"Using cached daily quote for {today}", flush=True) 
-            return QUOTE_CACHE["quote"]
-        recent = list(QUOTE_CACHE.get("recent") or [])
+    today = toronto_day()
+    def payload(recent):
+        system = build_quote_system_prompt(recent)
+        user = build_quote_user_prompt(today)
+        return {"model": OLLAMA_MODEL, "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
+                "stream": False,
+                "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 2048, "num_ctx": 16384}}
+    result = _daily_quotes().get(payload, quote_is_usable)
+    return result['quote']
 
-    system = build_quote_system_prompt(recent)
-    user = build_quote_user_prompt(today)
+def todo_display_rows(lines):
+    rows = [line for line in lines[:6] if not is_effectively_blank_line(line)]
+    used = len(rows)
+    rows += [''] * (6 - used)
+    quote_idx = None
+    if used <= 3:
+        rows[3], rows[4] = '', ollama_daily_quote()
+        quote_idx = 4
+    return rows, quote_idx
 
-    url = f"{OLLAMA_URL}/api/generate"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
-        "stream": False,
-        "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 2048, "num_ctx": 16384},
-}
-
-    fallback_quotes = [
-        "A quiet day still counts as progress.",
-        "Less chaos, more traction.",
-        "No fires today. Enjoy the rare upgrade.",
-        "Even a calm day is a win.",
-        "Momentum rests too. Then it rolls again.",
-        "Today’s task list: successfully have a day.",
-    ]
-
-    q = ""
-    try:
-        for attempt in range(3):
-            data = runner_generate(payload, f"quote-{today}-{attempt}")
-            raw = (data.get("response") or "").strip()
-            print(f"quote: final_empty={not bool(raw)} done={data.get('done') is True} "
-                  f"length_limit={data.get('done_reason') == 'length'} "
-                  f"thinking_present={bool(data.get('thinking'))}", flush=True)
-            if not raw:
-                break
-            raw = raw.splitlines()[0].strip()
-            raw = clean_quote_text(raw)
-            if quote_is_usable(raw):
-                q = raw
-                break
-    except CoordinationError:
-        raise
-    except Exception:
-        q = ""
-
-    if not q:
-        idx = abs(hash(today)) % len(fallback_quotes)
-        q = fallback_quotes[idx]
-
-    with QUOTE_LOCK:
-        QUOTE_CACHE["day"] = today
-        QUOTE_CACHE["quote"] = q
-
-        updated_recent = list(QUOTE_CACHE.get("recent") or [])
-        updated_recent.append(q)
-
-        # keep only the last 10
-        QUOTE_CACHE["recent"] = updated_recent[-10:]
-
-    return q
 
 def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
     tasks = []
@@ -1434,14 +1391,14 @@ def render_wallpaper(path: str):
 
     # Try cached AI lines first (cheap)
     with TODO_AI_LOCK:
-        ai_lines = list(TODO_AI_CACHE.get("lines") or [])
+        ai_lines = list(TODO_AI_CACHE.get("lines") or []) if TODO_AI_CACHE.get("day") == toronto_day() else []
         ai_summary = (TODO_AI_CACHE.get("summary_line") or "").strip()
         quote_idx = TODO_AI_CACHE.get("quote_idx")
 
     if ai_lines:
     # Quote appears on visible line 5 (idx 4) only when we inserted it:
     # buffer line (idx 3) blank + idx 4 non-empty
-        quote_idx = 4 if (len(ai_lines) >= 5 and not (ai_lines[3] or "").strip() and (ai_lines[4] or "").strip()) else None
+        ai_lines, quote_idx = todo_display_rows(ai_lines)
 
         prev_was_task = False
 
@@ -1495,8 +1452,12 @@ def render_wallpaper(path: str):
         if not shown:
             shown = ["Nothing planned"]
 
-        for text in shown:
-            line = f"• {text}"
+        shown, quote_idx = todo_display_rows(shown)
+        for idx, text in enumerate(shown):
+            if not text:
+                y += (todo_font.size + 6) + 10
+                continue
+            line = text if idx == quote_idx else f"• {text}"
             wrapped = wrap_text(d, line, todo_font, task_width(y))
             wrapped = [clamp_to_width(d, text, todo_font, task_width(y)) for text in wrapped[:1]]
             draw_wrapped_lines(d, tx0 + t_inner, y, wrapped, todo_font, (14,14,14), max_lines=1, line_gap=6)
@@ -1575,11 +1536,16 @@ def todo_ai_refresh():
     items_open = _todo_items_open_sorted(TODO_ENTITY)
     h = _stable_todo_hash(items_open)
 
-    today = date.today().isoformat()
+    today = toronto_day()
 
     with TODO_AI_LOCK:
         if TODO_AI_CACHE["hash"] == h and TODO_AI_CACHE.get("day") == today:
-            return {"ok": True, "changed": False, "hash": h, "cached": True}
+            cached_lines = list(TODO_AI_CACHE['lines'])
+        else:
+            cached_lines = None
+    if cached_lines is not None:
+        shown, _ = todo_display_rows(cached_lines)
+        return {"ok": True, "changed": False, "hash": h, "cached": True, "lines": shown}
 
     # Not cached → run ollama
     formatted = ollama_format_todo(items_open)
@@ -1600,27 +1566,7 @@ def todo_ai_refresh():
             lines[i] = ""
             break
 
-    # ---- pack + optional quote (ONLY touch lines 0..5) ----
-    packed = [ln for ln in lines[:6] if (ln or "").strip()]
-
-    new6 = [""] * 6
-    for i, ln in enumerate(packed[:6]):
-        new6[i] = ln
-
-    used = sum(1 for ln in new6 if ln.strip())
-    blanks = 6 - used
-
-    print(f"todo_ai_refresh: used={used} quote_allowed={used == 0 or used <= 3}", flush=True)
-
-    # If no tasks, or at least 2 free lines, insert quote with a buffer line above it
-    quote_idx = None
-    if used == 0 or used <= 3:
-        q = ollama_daily_quote()
-        new6[3] = ""   # buffer (line 4)
-        new6[4] = q    # quote  (line 5)
-        quote_idx = 4
-
-    lines[:6] = new6
+    lines[:6] = ([ln for ln in lines[:6] if not is_effectively_blank_line(ln)] + [''] * 6)[:6]
 
     # If line 7 is empty, synthesize it.
     if not lines[6].strip():
@@ -1633,6 +1579,7 @@ def todo_ai_refresh():
         TODO_AI_CACHE["ts"] = int(time.time())
         TODO_AI_CACHE["day"] = today
 
+    lines[:6], _ = todo_display_rows(lines[:6])
     return {
         "ok": True,
         "changed": True,
