@@ -153,7 +153,7 @@ class RenderingTests(unittest.TestCase):
         draw = ImageDraw.Draw(Image.new('RGB', (1600, 1200)))
         for status, expected in ((RecoveryStatus(3, False, False), '↻ 3'),
                                  (RecoveryStatus(3, True, False), '↻ 3 !'),
-                                 (RecoveryStatus(3, True, True), '↻ 3 ?'), (RecoveryStatus(), '↻ - ?')):
+                                 (RecoveryStatus(3, True, True), '↻ 3 ! ?'), (RecoveryStatus(), '↻ - ?')):
             item = ns['recovery_indicator_layout'](draw, panel, status)
             self.assertEqual(item['text'], expected)  # DejaVuSans really supports ↻.
             self.assertEqual(item['font'].size, 19)

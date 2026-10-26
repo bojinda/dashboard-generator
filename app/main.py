@@ -21,7 +21,9 @@ from config import (
 )
 from clothing import choose_clothing_profile
 from gpu_runner import generate as runner_generate, wallpaper as runner_wallpaper
-from recovery_status import RecoveryStatusReader
+from recovery_status import RecoveryStatusReader, environment_transport
+from recovery_ack import RecoveryAcknowledgment
+import hmac
 from daily_quotes import DailyQuotes, toronto_day
 from aihub_gpu_runner.client import CURRENT_OPERATION, CoordinationError, OutputBusy, OutputSlot
 
@@ -75,7 +77,7 @@ def recovery_indicator_layout(draw, panel, status):
     except (UnicodeError, OSError, ValueError):
         symbol = '~'
     count = '-' if status.count is None else str(status.count)
-    suffix = ' ?' if status.stale else ' !' if status.operator_required else ''
+    suffix = (' !' if status.operator_required else '') + (' ?' if status.stale else '')
     text = f'{symbol} {count}{suffix}'
     bbox = draw.textbbox((0, 0), text, font=font)
     right, bottom = panel[2] - 26, panel[3] - 26
@@ -96,7 +98,26 @@ def draw_recovery_indicator(draw, indicator):
     draw.text(indicator['xy'], indicator['text'], font=indicator['font'], fill=(96, 96, 96))
 
 
-_RECOVERY_STATUS = RecoveryStatusReader(lambda: _output_slot().store)
+_RECOVERY_ACK = RecoveryAcknowledgment(lambda: _output_slot().store, environment_transport)
+_RECOVERY_STATUS = RecoveryStatusReader(lambda: _output_slot().store, acknowledgment=_RECOVERY_ACK)
+
+@app.post('/recovery-counter/acknowledge')
+def acknowledge_recovery_counter(authorization: str | None = Header(None)):
+    secret = os.environ.get('RECOVERY_ACK_TOKEN', '')
+    if (not re.fullmatch(r'[A-Za-z0-9_-]{43,128}', secret) or
+            hmac.compare_digest(secret.encode(), os.environ.get('GPU_RUNNER_TOKEN', '').encode())):
+        raise HTTPException(status_code=503, detail='dedicated_acknowledgment_token_required')
+    if not isinstance(authorization, str) or len(authorization) > 256 or not hmac.compare_digest(
+            authorization.encode(), ('Bearer ' + secret).encode()):
+        raise HTTPException(status_code=401, detail='unauthorized')
+    try:
+        result = _RECOVERY_ACK.acknowledge()
+        with _RECOVERY_STATUS.lock:
+            _RECOVERY_STATUS.next_check = 0
+        return result
+    except Exception:
+        raise HTTPException(status_code=503, detail='fresh_exact_recovery_inventory_unavailable') from None
+
 
 def ha_get_state(entity_id: str) -> dict:
     if not HA_TOKEN:

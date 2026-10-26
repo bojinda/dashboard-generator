@@ -45,14 +45,15 @@ class RecoveryStatusReader:
     optional AtomicStore is the existing dashboard output-operation store.
     """
     def __init__(self, store_factory, transport_factory=environment_transport, *,
-                 clock=lambda: datetime.now(timezone.utc), monotonic=time.monotonic):
+                 clock=lambda: datetime.now(timezone.utc), monotonic=time.monotonic, acknowledgment=None):
         self.store_factory, self.transport_factory = store_factory, transport_factory
         self.clock, self.monotonic = clock, monotonic
         self.lock = threading.Lock()
         self.cached, self.thread, self.store = None, None, None
         self.loaded, self.failed, self.next_check = False, False, 0
+        self.acknowledgment, self.inventory = acknowledgment, None
 
-    def _refresh(self):
+    def _refresh(self, fetch=True):
         try:
             if not self.loaded:
                 try:
@@ -62,16 +63,43 @@ class RecoveryStatusReader:
                         cached = validate_summary(cached, self.clock())
                         with self.lock:
                             self.cached = cached
+                    if self.acknowledgment:
+                        from recovery_ack import validate_inventory
+                        inventory = self.store.read('recovery-incidents.json')
+                        if inventory is not None:
+                            self.inventory = validate_inventory(inventory, self.clock())
                 except Exception:
                     pass
                 finally:
                     self.loaded = True
+            if self.acknowledgment:
+                self.acknowledgment.reload()
+            if not fetch:
+                return
+            if self.acknowledgment:
+                try:
+                    inventory = self.acknowledgment.fetch()
+                except Exception:
+                    inventory = None
+                if inventory is not None:
+                    summary = {k: inventory[k] for k in FIELDS}
+                    with self.lock:
+                        self.inventory, self.cached, self.failed = inventory, summary, False
+                    try:
+                        if self.store is not None:
+                            self.store.write('recovery-incidents.json', inventory)
+                            self.store.write('recovery-summary.json', summary)
+                    except Exception:
+                        pass
+                    return
             status, media, data = self.transport_factory().request('GET', '/recovery-summary')
             if status != 200 or media != 'application/json' or len(data) > 2048:
                 raise ValueError('recovery_summary_unavailable')
             summary = validate_summary(strict_json(data), self.clock())
             with self.lock:
                 self.cached, self.failed = summary, False
+                if self.acknowledgment:
+                    self.inventory = None
             try:
                 if self.store is not None:
                     self.store.write('recovery-summary.json', summary)
@@ -84,9 +112,10 @@ class RecoveryStatusReader:
     def read(self, wait_budget=.15):
         """Return truthful cached/unknown status even if refresh never returns."""
         with self.lock:
-            if self.monotonic() >= self.next_check and not (self.thread and self.thread.is_alive()):
-                self.next_check = self.monotonic() + 60
-                self.thread = threading.Thread(target=self._refresh, name='recovery-summary', daemon=True)
+            due = self.monotonic() >= self.next_check
+            if (due or self.acknowledgment) and not (self.thread and self.thread.is_alive()):
+                if due: self.next_check = self.monotonic() + 60
+                self.thread = threading.Thread(target=self._refresh, args=(due,), name='recovery-summary', daemon=True)
                 try:
                     self.thread.start()
                 except RuntimeError:
@@ -98,5 +127,7 @@ class RecoveryStatusReader:
             if self.cached is None:
                 return RecoveryStatus()
             age = self.clock() - datetime.fromisoformat(self.cached['snapshot_at'].replace('Z', '+00:00'))
-            return RecoveryStatus(self.cached['incidents_7d'], self.cached['operator_required'],
-                                  self.failed or age > timedelta(minutes=15))
+            count = (self.acknowledgment.displayed(self.inventory, self.cached['incidents_7d'])
+                     if self.acknowledgment else self.cached['incidents_7d'])
+            return RecoveryStatus(count, self.cached['operator_required'],
+                                  self.failed or count is None or age > timedelta(minutes=15))
