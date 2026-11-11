@@ -1,4 +1,5 @@
 {
+  ".gitattributes": "8168e2543bd557f46635b2a98b19062e6cf1cb3059c738d5160fe5f6d660f53e",
   "DEPLOYED-MANIFEST.json": "f2de1b9da8e30d4658b99a4ad2894e36bde5214f56dc9cedc5f1324c8d4f0004",
   "diffs/app__main.py.patch": "4fb8cd40a16480ad16c44127899fb7bf134850c4abed883f7bda76acbd5f8e59",
   "qualification/app/clothing.py": "d9a9509bc22fd36099bd9e1971a3a644e74dd8f9fc0a909ed2a9657bdcbb760d",
