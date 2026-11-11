@@ -1,0 +1,1799 @@
+# /opt/dashboard-gen/app/main.py
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Header
+from PIL import Image, ImageDraw, ImageFont
+from config import (
+    OUT_PATH,
+    BIN_BYTES_EXPECTED,
+    HA_URL,
+    HA_TOKEN,
+    WEATHER_ENTITY,
+    CALENDAR_ENTITY,
+    TODO_ENTITY,
+    OLLAMA_URL,
+    OLLAMA_MODEL,
+    COMFY_INPUT_IMAGE,
+    COMFY_URL,
+    COMFY_WORKFLOW_FILE,
+    EPD_PUSH_ENABLED,
+    EPD_PUSH_URL,
+    EPD_PUSH_FAIL_HARD,
+    EPD_ROTATE_CW,
+)
+from clothing import choose_clothing_profile
+from gpu_runner import generate as runner_generate, wallpaper as runner_wallpaper
+from recovery_status import RecoveryStatusReader, environment_transport
+from recovery_ack import RecoveryAcknowledgment
+import hmac
+from daily_quotes import DailyQuotes, toronto_day
+from pipeline_status import stage_event, pipeline_summary, abort_pipeline, failure_reason, delivery_reason
+from aihub_gpu_runner.client import KnownJobFailure
+from aihub_gpu_runner.client import CURRENT_OPERATION, CoordinationError, OutputBusy
+from media_dispatch import DispatchOutputSlot as OutputSlot, DispatchBlocked, public_operation
+
+
+from prompts import (
+    BASE_IMAGE_PROMPT,
+    build_quote_system_prompt,
+    build_quote_user_prompt,
+    build_todo_system_prompt,
+    build_todo_user_prompt,
+    build_overlay_system_prompt,
+    build_overlay_user_prompt,
+    build_season_system_prompt,
+    build_season_user_prompt,
+    build_final_prompt,
+)
+
+from datetime import date, datetime, timedelta
+import threading
+import os
+import re
+import json
+import time
+import requests
+import subprocess
+import io
+import hashlib
+
+app = FastAPI()
+
+JOB_LOCK = threading.Lock()
+JOB_RUNNING = False
+LAST_JOB = {"status": "idle", "started": None, "finished": None, "error": None}
+
+def load_font(size: int):
+    # Use an explicit path so Pillow never falls back silently
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    try:
+        return ImageFont.truetype(font_path, size)
+    except Exception as e:
+        print(f"FONT LOAD FAILED size={size} path={font_path}: {e}", flush=True)
+        return ImageFont.load_default()
+
+
+def recovery_indicator_layout(draw, panel, status):
+    font = load_font(19)
+    try:
+        arrow = font.getmask('↻')
+        missing = font.getmask('\u0378')
+        symbol = '↻' if (arrow.size, bytes(arrow)) != (missing.size, bytes(missing)) and arrow.getbbox() else '~'
+    except (UnicodeError, OSError, ValueError):
+        symbol = '~'
+    count = '-' if status.count is None else str(status.count)
+    suffix = (' !' if status.operator_required else '') + (' ?' if status.stale else '')
+    text = f'{symbol} {count}{suffix}'
+    bbox = draw.textbbox((0, 0), text, font=font)
+    right, bottom = panel[2] - 26, panel[3] - 26
+    xy = (right - bbox[2], bottom - bbox[3])
+    return {'text': text, 'font': font, 'xy': xy,
+            'bounds': (xy[0] + bbox[0], xy[1] + bbox[1], right, bottom)}
+
+
+def todo_text_width(y, font, text_x, max_width, indicator):
+    # Only the bottom text row shares space with the indicator. Keep all upper
+    # task/address/quote lines at their existing width and positions.
+    if y + font.getbbox('Ágj')[3] >= indicator['bounds'][1] - 8:
+        return max(0, min(max_width, indicator['bounds'][0] - 16 - text_x))
+    return max_width
+
+
+def draw_recovery_indicator(draw, indicator):
+    draw.text(indicator['xy'], indicator['text'], font=indicator['font'], fill=(96, 96, 96))
+
+
+_RECOVERY_ACK = RecoveryAcknowledgment(lambda: _output_slot().store, environment_transport)
+_RECOVERY_STATUS = RecoveryStatusReader(lambda: _output_slot().store, acknowledgment=_RECOVERY_ACK)
+
+@app.post('/recovery-counter/acknowledge')
+def acknowledge_recovery_counter(authorization: str | None = Header(None)):
+    secret = os.environ.get('RECOVERY_ACK_TOKEN', '')
+    if (not re.fullmatch(r'[A-Za-z0-9_-]{43,128}', secret) or
+            hmac.compare_digest(secret.encode(), os.environ.get('GPU_RUNNER_TOKEN', '').encode())):
+        raise HTTPException(status_code=503, detail='dedicated_acknowledgment_token_required')
+    if not isinstance(authorization, str) or len(authorization) > 256 or not hmac.compare_digest(
+            authorization.encode(), ('Bearer ' + secret).encode()):
+        raise HTTPException(status_code=401, detail='unauthorized')
+    try:
+        result = _RECOVERY_ACK.acknowledge()
+        with _RECOVERY_STATUS.lock:
+            _RECOVERY_STATUS.next_check = 0
+        return result
+    except Exception:
+        raise HTTPException(status_code=503, detail='fresh_exact_recovery_inventory_unavailable') from None
+
+
+def ha_get_state(entity_id: str) -> dict:
+    if not HA_TOKEN:
+        return {"state": "unknown", "attributes": {"friendly_name": entity_id, "note": "HA_TOKEN missing"}}
+    url = f"{HA_URL}/api/states/{entity_id}"
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+    try:
+        r = requests.get(url, headers=headers, timeout=6)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        return {"state": "unknown", "attributes": {"friendly_name": entity_id, "error": str(e)}}
+
+def ha_call_service(domain: str, service: str, data: dict | None = None, target: dict | None = None, return_response: bool = False):
+    if not HA_TOKEN:
+        raise RuntimeError("HA_TOKEN missing")
+
+    base = f"{HA_URL}/api/services/{domain}/{service}"
+    url = base + ("?return_response" if return_response else "")
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+
+    payload = {}
+    if data:
+        payload.update(data)
+    if target:
+        payload["target"] = target
+
+    r = requests.post(url, headers=headers, json=payload, timeout=45)
+    r.raise_for_status()
+    return r.json()
+
+def ha_calendar_get_events(entity_id: str, hours_ahead: int = 36):
+    now = datetime.now().astimezone()
+    end = now + timedelta(hours=hours_ahead)
+
+    data = {
+        "start_date_time": now.isoformat(timespec="seconds"),
+        "end_date_time": end.isoformat(timespec="seconds"),
+        "entity_id": entity_id,
+    }
+
+    return ha_call_service("calendar", "get_events", data=data, return_response=True)
+
+def ha_calendar_get_events_range(entity_id: str, start_dt: datetime, end_dt: datetime):
+    data = {
+        "start_date_time": start_dt.astimezone().isoformat(timespec="seconds"),
+        "end_date_time": end_dt.astimezone().isoformat(timespec="seconds"),
+        "entity_id": entity_id,
+    }
+
+    return ha_call_service("calendar", "get_events", data=data, return_response=True)
+
+def extract_clothing_weather_inputs(state_obj: dict) -> tuple[float, str, str, bool]:
+    attr = state_obj.get("attributes", {}) or {}
+    state = (state_obj.get("state") or "").lower().strip()
+
+    temp_raw = _first_present(attr, ["temperature", "temp"])
+    try:
+        temp_c = float(temp_raw)
+    except Exception:
+        temp_c = 10.0
+
+    precip = "none"
+    intensity = "none"
+    icy = False
+
+    if any(w in state for w in ["thunderstorm", "pouring", "storm"]):
+        precip = "rain"
+        intensity = "heavy"
+    elif any(w in state for w in ["rainy", "rain", "showers"]):
+        precip = "rain"
+        intensity = "moderate"
+    elif any(w in state for w in ["drizzle"]):
+        precip = "rain"
+        intensity = "light"
+    elif any(w in state for w in ["snowy", "snow", "flurr", "blizzard"]):
+        precip = "snow"
+        intensity = "moderate"
+    elif any(w in state for w in ["sleet", "freezing rain", "hail"]):
+        precip = "mixed"
+        intensity = "moderate"
+
+    if temp_c <= 0 or "ice" in state or "freezing" in state or precip in {"snow", "mixed"}:
+        icy = True
+
+    return temp_c, precip, intensity, icy
+
+TODO_AI_CACHE = {
+    "hash": None,
+    "lines": [],          # up to 6 lines to draw (already bullet-prefixed or not—your choice)
+    "summary_line": "",   # the "+N more — ..." line
+    #"quote_idx": None,
+    "day": None,
+    "ts": 0,
+}
+
+
+TODO_AI_LOCK = threading.Lock()
+
+def _norm_ws(s: str) -> str:
+    return " ".join((s or "").replace("\n", " ").split()).strip()
+
+def clamp_to_width(draw, text: str, font, max_w: int) -> str:
+    text = (text or "").rstrip()
+    if draw.textlength(text, font=font) <= max_w:
+        return text
+    # Hard truncate until it fits
+    s = text
+    while s and draw.textlength(s + "…", font=font) > max_w:
+        s = s[:-1]
+    return (s.rstrip() + "…") if s else ""
+
+def is_effectively_blank_line(s: str) -> bool:
+    s = (s or "").strip()
+    if not s:
+        return True
+
+    # treat placeholder-only lines as blank
+    stripped = s.replace("•", "").replace("-", "").replace("—", "").replace("_", "").replace(".", "").strip()
+    return stripped == ""
+
+def _stable_todo_hash(items: list[dict]) -> str:
+    """
+    Hash only fields that should affect formatting/display.
+    Ignore uid order instability by sorting.
+    """
+    rows = []
+    for it in items:
+        status = (it.get("status") or "").lower().strip()
+        if status == "completed":
+            continue
+        summary = _norm_ws(it.get("summary") or it.get("item") or "")
+        due = _norm_ws(it.get("due") or "")
+        desc = _norm_ws(it.get("description") or "")
+        rows.append({"summary": summary, "due": due, "description": desc, "status": status})
+    rows.sort(key=lambda r: (r["due"], r["summary"], r["description"]))
+
+    blob = json.dumps(rows, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+
+def quote_is_usable(s: str) -> bool:
+    s = _norm_ws(s)
+    if not s:
+        return False
+
+    # Reject non-ASCII / non-English-ish spill
+    if any(ord(ch) > 127 for ch in s):
+        return False
+
+    low = s.lower()
+
+    # Reject meta / apology / restart chatter
+    bad_phrases = [
+        "sorry",
+        "apolog",
+        "let me",
+        "retry",
+        "redo",
+        "here's",
+        "here is",
+        "instead",
+        "use this",
+        "revised",
+    ]
+    if any(p in low for p in bad_phrases):
+        return False
+
+    # Too long / too short
+    if len(s) < 20 or len(s) > 80 or s[-1] not in '.!?':
+        return False
+
+    return True
+
+def clean_quote_text(s: str) -> str:
+    s = _norm_ws(s)
+    # Strip non-ascii just in case
+    s = "".join(ch for ch in s if ord(ch) < 128)
+    return s[:80].rstrip()
+
+def _todo_items_open_sorted(entity_id: str) -> list[dict]:
+    items = ha_todo_get_items(entity_id)
+    open_items = []
+    for it in items:
+        status = (it.get("status") or "").lower()
+        if status == "completed":
+            continue
+        summary = _norm_ws(it.get("summary") or it.get("item") or "")
+        if not summary:
+            continue
+        open_items.append(it)
+
+    # sort: all-day first (no due time), then due time
+    def sort_key(it):
+        due = (it.get("due") or "").strip()
+        # due may be "", date only, or ISO datetime. We'll use your existing parser.
+        day, tstr, all_day = _parse_event_start(due)  # works for ISO; for "" -> all_day
+        # all_day first
+        group = 0 if (tstr is None) else 1
+        t = tstr or "00:00"
+        return (group, t, _norm_ws(it.get("summary") or it.get("item") or "").lower())
+
+    open_items.sort(key=sort_key)
+    return open_items
+
+
+_DAILY_QUOTES = None
+
+def _daily_quotes():
+    global _DAILY_QUOTES
+    if _DAILY_QUOTES is None:
+        _DAILY_QUOTES = DailyQuotes(lambda: _output_slot().store)
+    return _DAILY_QUOTES
+
+def ollama_daily_quote() -> str:
+    today = toronto_day()
+    def payload(recent):
+        system = build_quote_system_prompt(recent)
+        user = build_quote_user_prompt(today)
+        return {"model": OLLAMA_MODEL, "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
+                "stream": False,
+                "options": {"temperature": 1.0, "top_p": 0.95, "num_predict": 2048, "num_ctx": 16384}}
+    result = _daily_quotes().get(payload, quote_is_usable)
+    stage_event('quote', 'uncertain' if result['reason'] == 'runner_uncertain' else result['status'], result['reason'])
+    return result['quote']
+
+def todo_display_rows(lines):
+    rows = [line for line in lines[:6] if not is_effectively_blank_line(line)]
+    used = len(rows)
+    rows += [''] * (6 - used)
+    quote_idx = None
+    if used <= 3:
+        rows[3], rows[4] = '', ollama_daily_quote()
+        quote_idx = 4
+    return rows, quote_idx
+
+
+def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
+    stage_event('todo', 'running')
+    tasks = []
+    for it in items_open_sorted:
+        summary = _norm_ws(it.get("summary") or it.get("item") or "")
+        due = _norm_ws(it.get("due") or "")
+        desc = (it.get("description") or "").strip()
+        desc = desc.replace("\r\n", "\n").replace("\r", "\n").strip()
+        tasks.append({"summary": summary, "due": due, "description": desc})
+
+    system = build_todo_system_prompt()
+    user = build_todo_user_prompt(tasks)
+
+    url = f"{OLLAMA_URL}/api/generate"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
+        "stream": False,
+        "options": {"temperature": 0.2, "top_p": 0.9, "num_predict": 4096, "num_ctx": 16384},
+    }
+
+    try:
+        data = runner_generate(payload, "todo-format")
+        out = (data.get("response") or "").strip()
+        print(f"todo-format: final_empty={not bool(out)} done={data.get('done') is True} "
+              f"length_limit={data.get('done_reason') == 'length'} "
+              f"thinking_present={bool(data.get('thinking'))}", flush=True)
+        if data.get("done") is not True or data.get("done_reason") == "length":
+            raise ValueError("incomplete_todo_generation")
+        lines = [ln.rstrip() for ln in out.splitlines()]
+        if not out or (tasks and not any(
+                not is_effectively_blank_line(ln) and
+                not (ln.lstrip().startswith("+") and "more" in ln.lower()) for ln in lines[:6])):
+            raise ValueError("empty_final_task_response")
+    except CoordinationError as exc:
+        stage_event('todo', 'uncertain', 'runner_uncertain', exc)
+        raise
+    except Exception as e:
+        stage_event('todo', 'fallback', failure_reason(e, 'invalid_model_output'), e)
+        print(f"todo formatting failed; using Home Assistant tasks ({type(e).__name__})", flush=True)
+        raw_lines = []
+        for t in tasks[:6]:
+            line = t["summary"]
+            if t["description"]:
+                line = f'{line} — {_norm_ws(t["description"])}' if line else _norm_ws(t["description"])
+            if t["due"]:
+                line = f'{t["due"]} — {line}'
+            raw_lines.append(line)
+        while len(raw_lines) < 6:
+            raw_lines.append("")
+        return {"lines": raw_lines[:6], "summary_line": "+0 more — fallback mode", "fallback": True}
+
+    if len(lines) < 7:
+        lines = lines + [""] * (7 - len(lines))
+    elif len(lines) > 7:
+        lines = lines[:7]
+
+    stage_event('todo', 'success')
+    return {"lines": lines[:6], "summary_line": lines[6]}
+
+def ha_todo_get_items(entity_id: str):
+    """
+    Returns list of items with at least: summary, uid/item_id, status.
+    Different HA versions may name the id field differently; we handle both.
+    """
+    # Most HA installs require return_response for get_items
+    data = {"entity_id": entity_id}
+    resp = ha_call_service("todo", "get_items", data=data, return_response=True)
+
+    # Common structure: {"service_response": {"todo.xxx": {"items":[...]}}}
+    sr = (resp or {}).get("service_response") or {}
+    obj = sr.get(entity_id) or {}
+    items = obj.get("items") or []
+    return items if isinstance(items, list) else []
+
+def ha_todo_add_item(entity_id: str, summary: str, *, due_date: str | None = None, due_datetime: str | None = None, description: str | None = None):
+    data = {"entity_id": entity_id, "item": summary}
+    if description:
+        data["description"] = description
+    if due_datetime:
+        data["due_datetime"] = due_datetime  # "YYYY-MM-DD HH:MM:SS"
+    elif due_date:
+        data["due_date"] = due_date          # "YYYY-MM-DD"
+    ha_call_service("todo", "add_item", data=data, return_response=False)
+
+def ha_todo_remove_item(entity_id: str, item_text: str):
+    # remove_item expects the item SUMMARY TEXT, not an id
+    data = {"entity_id": entity_id, "item": item_text}
+    ha_call_service("todo", "remove_item", data=data, return_response=False)
+
+def ha_todo_clear_list(entity_id: str):
+    """
+    Remove ALL items from the todo list (replace behavior).
+    Uses remove_item(item=<text>) because your HA expects text, not item_id.
+    """
+    items = ha_todo_get_items(entity_id)
+    removed = 0
+
+    # Remove by summary text
+    for it in items:
+        summary = (it.get("summary") or it.get("item") or "").strip()
+        if not summary:
+            continue
+        ha_todo_remove_item(entity_id, summary)
+        removed += 1
+
+    return removed
+
+@app.get("/todo_debug")
+def todo_debug():
+    try:
+        items = ha_todo_get_items(TODO_ENTITY)
+        return {"ok": True, "todo_entity": TODO_ENTITY, "count": len(items), "items": items[:20]}
+    except Exception as e:
+        return {"ok": False, "todo_entity": TODO_ENTITY, "error": str(e)}
+
+@app.get("/calendar_debug")
+def calendar_debug():
+    entity_id = CALENDAR_ENTITY
+    try:
+        resp = ha_calendar_get_events(entity_id, hours_ahead=36)
+        return {"ok": True, "entity": entity_id, "raw": resp}
+    except Exception as e:
+        return {"ok": False, "entity": entity_id, "error": str(e)}
+
+def calendar_events_today(entity_id: str):
+    today = datetime.now().astimezone().date()
+    today_dt = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+    end_dt   = today_dt + timedelta(days=1)
+
+    raw = ha_calendar_get_events_range(entity_id, today_dt, end_dt)
+    sr = (raw or {}).get("service_response") or {}
+    cal_obj = sr.get(entity_id) or {}
+    events = cal_obj.get("events") or []
+    if not isinstance(events, list):
+        return []
+
+    out = []
+    for e in events:
+        start_raw = e.get("start") or ""
+        summary = (e.get("summary") or "(no title)").strip()
+        desc = (e.get("description") or "").strip()
+        loc  = (e.get("location") or "").strip()
+
+        day, tstr, all_day = _parse_event_start(start_raw)
+        if day != today:
+            continue
+
+        out.append({
+            "start_raw": start_raw,
+            "time": tstr,
+            "summary": summary,
+            "description": desc,
+            "location": loc,
+            "all_day": all_day,
+        })
+
+    def key(it):
+        if it["time"] is None:
+            return (0, "00:00", it["summary"].lower())  # all-day first
+        return (1, it["time"], it["summary"].lower())  # then timed
+    out.sort(key=key)
+
+    return out
+
+def parse_task_key_and_text(raw: str):
+    raw = (raw or "").strip()
+    if raw.startswith("A|"):
+        return (0, "00:00", raw[2:].strip())
+    if raw.startswith("T@") and "|" in raw:
+        t = raw[2:7]
+        txt = raw.split("|", 1)[1].strip()
+        return (1, t, txt)
+    return (2, "99:99", raw)
+
+def build_tasks_from_events(events_today: list[dict]) -> list[dict]:
+    out = []
+    for e in events_today:
+        summary = (e.get("summary") or "").strip()
+        if not summary:
+            continue
+
+        desc = (e.get("description") or "").strip()
+        loc  = (e.get("location") or "").strip()
+        full_desc = (desc + ("\n\n" + loc if loc else "")).strip() or None
+
+        # e["start_raw"] will be the original HA "start" string
+        start_raw = e.get("start_raw") or ""
+        day, tstr, all_day = _parse_event_start(start_raw)
+
+        if all_day or not tstr:
+            due_date = day.isoformat() if day else None
+            out.append({"summary": summary, "due_date": due_date, "due_datetime": None, "description": full_desc})
+        else:
+            # Convert "start_raw" to HA "due_datetime" format (YYYY-MM-DD HH:MM:SS)
+            dt = datetime.fromisoformat(start_raw.replace("Z", "+00:00")).astimezone()
+            due_dt = dt.strftime("%Y-%m-%d %H:%M:%S")
+            out.append({"summary": summary, "due_date": None, "due_datetime": due_dt, "description": full_desc})
+
+    return out or [{"summary": "Nothing planned", "due_date": datetime.now().astimezone().date().isoformat(), "due_datetime": None, "description": None}]
+
+# -------- EPD BIN GENERATION (epdoptimize) --------
+def generate_epaper_bin_epdoptimize(png_path: str, out_bin_path: str) -> int:
+    """
+    Uses epdoptimize JS pipeline to generate image_data.bin from wallpaper.png.
+    Returns byte count of the output bin.
+    """
+    env = os.environ.copy()
+    env["IN_PNG"] = png_path
+    env["OUT_BIN"] = out_bin_path
+    env["ROTATE_CW"] = env.get("ROTATE_CW", EPD_ROTATE_CW)
+    env["WRITE_PREVIEW"] = "0"  # stop producing wallpaper_epd.png
+
+    cmd = ["node", "/frame-tools/epdoptimize/render_epd_bin.js"]
+    r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"epdoptimize failed rc={r.returncode}\n"
+            f"STDOUT:\n{r.stdout}\n\nSTDERR:\n{r.stderr}"
+        )
+
+    st = os.stat(out_bin_path)
+    if st.st_size != BIN_BYTES_EXPECTED:
+        raise RuntimeError(f"bin size wrong: {st.st_size} bytes (expected {BIN_BYTES_EXPECTED})")
+    return st.st_size
+
+def looks_like_address_line(s: str) -> bool:
+    s2 = (s or "").strip()
+    if not s2:
+        return False
+    if not s2[0].isdigit():     # ✅ key fix: "Test1" will NOT match
+        return False
+
+    low = s2.lower()
+    street_words = r"\b(st|street|rd|road|ave|avenue|blvd|drive|dr|lane|ln|line|way|court|ct|cres|crescent)\b"
+    return ("," in s2) or (re.search(street_words, low) is not None)
+
+def wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_width: int) -> list[str]:
+    words = text.split()
+    lines = []
+    cur = ""
+    for w in words:
+        test = w if not cur else f"{cur} {w}"
+        if draw.textlength(test, font=font) <= max_width:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+def draw_wrapped_lines(draw: ImageDraw.ImageDraw, x: int, y: int, lines: list[str], font, fill, max_lines: int, line_gap: int = 8):
+    line_h = font.size + line_gap
+    for i, line in enumerate(lines[:max_lines]):
+        draw.text((x, y + i * line_h), line, font=font, fill=fill)
+
+def push_bin_to_epd(bin_path: str) -> None:
+    """
+    Push bin to ESP32 in TUNING mode (POST /bin). Optional; controlled via env.
+    """
+    if not EPD_PUSH_ENABLED:
+        return
+    if not EPD_PUSH_URL:
+        raise RuntimeError("EPD_PUSH_ENABLED=1 but EPD_PUSH_URL is empty")
+
+    with open(bin_path, "rb") as f:
+        data = f.read()
+
+    if len(data) != BIN_BYTES_EXPECTED:
+        raise RuntimeError(f"Refusing to push: bin size {len(data)} != {BIN_BYTES_EXPECTED}")
+
+    r = requests.post(
+        EPD_PUSH_URL,
+        data=data,
+        headers={"Content-Type": "application/octet-stream"},
+        timeout=30,
+    )
+    r.raise_for_status()
+    # ESP32 replies "OK\n"
+    if r.text.strip() != "OK":
+        raise RuntimeError(f"EPD push returned unexpected body: {r.text!r}")
+
+# -------- TIME / WEATHER HELPERS --------
+def _parse_ha_iso(dt_str: str):
+    """Parse HA ISO datetime like '2026-02-02T07:12:00-05:00' into aware datetime."""
+    if not dt_str:
+        return None
+    try:
+        return datetime.fromisoformat(dt_str)
+    except Exception:
+        return None
+
+def infer_day_or_night_from_weather(state_obj: dict) -> str:
+    """
+    Returns "day" or "night".
+    Prefer Home Assistant sun.sun if available.
+    Fall back to weather sunrise/sunset if present.
+    Last resort: local hour.
+    """
+    sun = ha_try_get("sun.sun")
+    if sun:
+        sun_state = (sun.get("state") or "").lower().strip()
+        if sun_state == "above_horizon":
+            return "day"
+        if sun_state == "below_horizon":
+            return "night"
+
+    attr = state_obj.get("attributes", {}) or {}
+    sunrise = _parse_ha_iso(attr.get("sunrise"))
+    sunset = _parse_ha_iso(attr.get("sunset"))
+    now = datetime.now().astimezone()
+
+    if sunrise and sunset:
+        if sunrise.tzinfo is None:
+            sunrise = sunrise.replace(tzinfo=now.tzinfo)
+        if sunset.tzinfo is None:
+            sunset = sunset.replace(tzinfo=now.tzinfo)
+        return "day" if sunrise <= now <= sunset else "night"
+
+    return "night" if (now.hour < 6 or now.hour >= 18) else "day"
+
+def ha_try_get(entity_id: str) -> dict | None:
+    if not HA_TOKEN:
+        return None
+    url = f"{HA_URL}/api/states/{entity_id}"
+    headers = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+    try:
+        r = requests.get(url, headers=headers, timeout=6)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+def _first_present(d: dict, keys: list):
+    for k in keys:
+        if k in d and d[k] is not None:
+            return d[k]
+    return None
+
+def infer_season(state_weather: dict) -> str:
+    """
+    Returns: 'winter' | 'spring' | 'summer' | 'autumn'
+    Prefers HA sensor.season if present; falls back to month + temperature.
+    """
+    s = ha_try_get("sensor.season")
+    if s:
+        val = (s.get("state") or "").lower().strip()
+        if val in ("winter", "spring", "summer", "autumn", "fall"):
+            return "autumn" if val == "fall" else val
+
+    now = datetime.now().astimezone()
+    m = now.month
+
+    attr = state_weather.get("attributes", {}) or {}
+    temp = _first_present(attr, ["temperature", "temp"])
+    try:
+        t = float(temp) if temp is not None else None
+    except Exception:
+        t = None
+
+    if m in (12, 1, 2):
+        base = "winter"
+    elif m in (3, 4, 5):
+        base = "spring"
+    elif m in (6, 7, 8):
+        base = "summer"
+    else:
+        base = "autumn"
+
+    if t is not None and t <= -1 and m in (3, 4, 11):
+        return "winter"
+
+    return base
+
+def draw_text_bold(draw, xy, text, font, fill, stroke_fill=None, stroke_width=2):
+    # Pillow supports stroke_width in recent versions; this is the cleanest bold.
+    try:
+        draw.text(
+            xy, text, font=font, fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=(stroke_fill if stroke_fill is not None else fill),
+        )
+    except TypeError:
+        # Fallback: manual "fake bold" by drawing multiple offsets
+        x, y = xy
+        for dx, dy in [(0,0), (1,0), (0,1), (1,1)]:
+            draw.text((x+dx, y+dy), text, font=font, fill=fill)
+
+def _parse_event_start(s: str):
+    """
+    Returns (date_obj, time_str_or_None, is_all_day)
+    Accepts:
+      - YYYY-MM-DD (all-day)
+      - ISO datetimes with Z/offset
+      - Naive datetimes like "YYYY-MM-DD HH:MM:SS" or "YYYY-MM-DDTHH:MM:SS"
+        (assumed local timezone)
+    """
+    if not s:
+        return None, None, True
+
+    s = s.strip()
+
+    # all-day format
+    if len(s) == 10 and s[4] == "-" and s[7] == "-":
+        try:
+            d = datetime.fromisoformat(s).date()
+            return d, None, True
+        except Exception:
+            return None, None, True
+
+    try:
+        # Normalize Zulu
+        s2 = s.replace("Z", "+00:00")
+
+        dt = datetime.fromisoformat(s2)
+
+        # If dt is naive, assume local timezone
+        if dt.tzinfo is None:
+            local_tz = datetime.now().astimezone().tzinfo
+            dt = dt.replace(tzinfo=local_tz)
+
+        dt = dt.astimezone()
+        return dt.date(), dt.strftime("%H:%M"), False
+    except Exception:
+        return None, None, True
+
+def group_events_by_day(events: list[dict]) -> list[tuple]:
+    """
+    Input: list of HA event dicts with start/end/summary.
+    Output: sorted list of (date_obj, [event_items]) where event_items are dicts:
+      {"time": "HH:MM"|None, "summary": str, "all_day": bool}
+    """
+    buckets: dict = {}
+    for e in events:
+        summary = (e.get("summary") or "(no title)").strip()
+        start = e.get("start") or ""
+        day, tstr, all_day = _parse_event_start(start)
+        if day is None:
+            continue
+        buckets.setdefault(day, []).append({"time": tstr, "summary": summary, "all_day": all_day})
+
+    # sort events within each day: timed first, then all-day (can flip later if you want)
+    for day, items in buckets.items():
+        def key(it):
+            if it["time"] is None:
+                return (1, "99:99", it["summary"].lower())
+            return (0, it["time"], it["summary"].lower())
+        items.sort(key=key)
+
+    days_sorted = sorted(buckets.keys())
+    return [(d, buckets[d]) for d in days_sorted]
+
+def push_existing_wallpaper_to_epd() -> dict:
+    if not os.path.exists(OUT_PATH):
+        raise FileNotFoundError('wallpaper_not_found')
+    stage_event('composition', 'cached')
+    response = _convert_and_deliver(OUT_PATH)
+    response['out'] = OUT_PATH
+    return response
+
+def format_weather_for_display(state_obj: dict) -> str:
+    state = state_obj.get("state", "unknown")
+    attr = state_obj.get("attributes", {}) or {}
+    name = attr.get("friendly_name", WEATHER_ENTITY)
+
+    temp = _first_present(attr, ["temperature", "temp"])
+    unit = _first_present(attr, ["temperature_unit", "unit_of_measurement"]) or "\u00b0C"
+    humidity = _first_present(attr, ["humidity"])
+    wind = _first_present(attr, ["wind_speed", "wind_speed_kmh", "wind"])
+    wind_unit = _first_present(attr, ["wind_speed_unit"]) or "km/h"
+
+    parts = [f"{name}: {state}"]
+    if temp is not None:
+        parts.append(f"{temp}{unit}")
+    if humidity is not None:
+        parts.append(f"{humidity}% humidity")
+    if wind is not None:
+        parts.append(f"wind {wind} {wind_unit}")
+    if "error" in attr:
+        parts.append("(weather fetch error)")
+    return " - ".join(parts)
+
+# -------- OLLAMA OVERLAY / SEASON --------
+_OVERLAY_RE = re.compile(
+    r"^WEATHER\s*OVERLAY:\nSky:\s+.+\nAir:\s+.+\nGround:\s+.+\nLanternLight:\s+.+\s*$",
+    re.MULTILINE
+)
+
+def overlay_is_valid(text: str, tod: str, weather_line: str = "") -> bool:
+    if not text:
+        return False
+
+    t = text.strip()
+    if not _OVERLAY_RE.match(t):
+        return False
+
+    low = t.lower()
+    weather_low = (weather_line or "").lower()
+
+    forbidden_always = ["indoors", "umbrella", "mask", "phone", "helmet"]
+    forbidden_day = ["moon", "moonlight", "starlight", "stars"]
+    forbidden_night = ["sun", "sunlight", "daylight"]
+
+    if any(w in low for w in forbidden_always):
+        return False
+    if tod == "day" and any(w in low for w in forbidden_day):
+        return False
+    if tod == "night" and any(w in low for w in forbidden_night):
+        return False
+
+    rain_now = any(w in weather_low for w in [
+        "rain", "rainy", "pouring", "shower", "showers", "drizzle", "storm", "thunderstorm"
+    ])
+    snow_now = any(w in weather_low for w in [
+        "snow", "snowy", "flurr", "blizzard", "sleet", "hail"
+    ])
+    fog_now = any(w in weather_low for w in [
+        "fog", "foggy", "mist", "misty", "haze", "hazy"
+    ])
+    clear_now = any(w in weather_low for w in [
+        "clear", "sunny", "fair"
+    ])
+
+    rain_terms = ["rain", "drizzle", "showers", "raindrops", "rain streaks", "falling rain"]
+    snow_terms = ["snow", "flurries", "falling snow", "snowflakes", "blowing snow"]
+    fog_terms = ["fog", "mist", "haze", "low visibility"]
+    clear_terms = ["clear", "dry air", "bright", "sunlit", "crisp air"]
+
+    if rain_now and not any(term in low for term in rain_terms):
+        return False
+    if snow_now and not any(term in low for term in snow_terms):
+        return False
+    if fog_now and not any(term in low for term in fog_terms):
+        return False
+
+    # Optional: stop the model from inventing rain during clearly dry weather
+    if clear_now and any(term in low for term in rain_terms + snow_terms):
+        return False
+
+    return True
+
+def ollama_generate_overlay(weather_line: str, tod: str, retries: int = 2) -> str:
+    stage_event('weather', 'running')
+
+    system = build_overlay_system_prompt(tod)
+    user = build_overlay_user_prompt(weather_line)
+
+    url = f"{OLLAMA_URL}/api/generate"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
+        "stream": False,
+        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 4096, "num_ctx": 16384},
+    }
+
+    last = ""
+    for attempt in range(retries + 1):
+        try:
+            data = runner_generate(payload, f"weather-overlay-{attempt}")
+            txt = (data.get("response") or "").strip()
+            print(f"weather-overlay: final_empty={not bool(txt)} done={data.get('done') is True} "
+                  f"length_limit={data.get('done_reason') == 'length'} "
+                  f"thinking_present={bool(data.get('thinking'))}", flush=True)
+            last = ""
+            if data.get("done_reason") == "length" or data.get("done") is not True:
+                continue
+            if overlay_is_valid(txt, tod, weather_line):
+                stage_event('weather', 'success')
+                return txt
+        except CoordinationError as exc:
+            stage_event('weather', 'uncertain', 'runner_uncertain', exc)
+            raise
+        except KnownJobFailure as exc:
+            stage_event('weather', 'fallback', 'runner_failed', exc)
+            return ''
+        except Exception as exc:
+            stage_event('weather', 'fallback', 'service_unavailable', exc)
+            return ''
+    stage_event('weather', 'fallback', 'invalid_model_output')
+    return last.strip()
+
+_SEASON_RE = re.compile(
+    r"^SEASONAL\s*ENVIRONMENT:\nTrees:\s+.+\nGround:\s+.+\nAir:\s+.+\nDistantDetails:\s+.+\s*$",
+    re.MULTILINE
+)
+
+def season_is_valid(text: str) -> bool:
+    if not text:
+        return False
+    t = text.strip()
+    if not _SEASON_RE.match(t):
+        return False
+
+    forbidden = [
+        "falling snow", "snow falling", "snowflakes", "flurr", "snowing",
+        "blowing snow", "drift", "whiteout",
+        "raining", "rainfall", "drizzle", "showers", "downpour",
+        "sleet", "hail", "thunderstorm", "storming",
+        "precip", "precipitation",
+    ]
+    low = t.lower()
+    return not any(w in low for w in forbidden)
+
+def scrub_precip_words(s: str) -> str:
+    return re.sub(
+        r"\b(snow|snowing|flurr(?:y|ies)|rain|raining|drizzle|showers?|sleet|hail)\b",
+        "precipitation",
+        s,
+        flags=re.I,
+    )
+
+def ollama_generate_season_block(season: str, tod: str, weather_line: str, retries: int = 2) -> str:
+    stage_event('season', 'running')
+
+    system = build_season_system_prompt(tod)
+
+    safe_weather = scrub_precip_words(weather_line)
+    user = build_season_user_prompt(season, tod, safe_weather)
+
+    url = f"{OLLAMA_URL}/api/generate"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": f"SYSTEM:\n{system}\n\nUSER:\n{user}\n",
+        "stream": False,
+        "options": {"temperature": 0.3, "top_p": 0.9, "num_predict": 4096, "num_ctx": 16384},
+    }
+
+    last = ""
+    for attempt in range(retries + 1):
+        try:
+            data = runner_generate(payload, f"season-block-{attempt}")
+            txt = (data.get("response") or "").strip()
+            print(f"season-block: final_empty={not bool(txt)} done={data.get('done') is True} "
+                  f"length_limit={data.get('done_reason') == 'length'} "
+                  f"thinking_present={bool(data.get('thinking'))}", flush=True)
+            last = ""
+            if data.get("done_reason") == "length" or data.get("done") is not True:
+                continue
+            if season_is_valid(txt):
+                stage_event('season', 'success')
+                return txt
+        except CoordinationError as exc:
+            stage_event('season', 'uncertain', 'runner_uncertain', exc)
+            raise
+        except KnownJobFailure as exc:
+            stage_event('season', 'fallback', 'runner_failed', exc)
+            return ''
+        except Exception as exc:
+            stage_event('season', 'fallback', 'service_unavailable', exc)
+            return ''
+    stage_event('season', 'fallback', 'invalid_model_output')
+    return last.strip()
+
+def build_clothing_block(profile: dict) -> str:
+    extras = ", ".join(profile.get("extras") or []) or "none"
+    return (
+        "CLOTHING OVERLAY:\n"
+        f"BaseTop: {profile.get('base_top') or 'none visible'}\n"
+        f"Outerwear: {profile.get('outerwear') or 'none'}\n"
+        f"SafetyVest: {profile.get('vest')}\n"
+        f"Legwear: {profile.get('legs')}\n"
+        f"Footwear: {profile.get('boots')}\n"
+        f"Extras: {extras}"
+    )
+
+def clean_for_json(s: str) -> str:
+    s = s.replace("\r\n", "\n").replace("\r", "\n")
+    s = "".join(ch for ch in s if ch in ("\n", "\t") or ord(ch) >= 32)
+    return s
+
+# -------- COMFYUI --------
+
+def randomize_workflow_seeds(workflow: dict) -> dict:
+    import random
+
+    for node_id, node in workflow.items():
+        if not isinstance(node, dict):
+            continue
+
+        inputs = node.get("inputs", {})
+        if not isinstance(inputs, dict):
+            continue
+
+        for key in list(inputs.keys()):
+            if key.lower() in {"seed", "noise_seed"}:
+                old = inputs[key]
+                inputs[key] = random.randint(0, 2**63 - 1)
+                print(f"[seed] randomized node {node_id} {key}: {old} -> {inputs[key]}", flush=True)
+
+    return workflow
+
+def comfy_render_image(final_prompt: str, width: int, height: int, timeout_s: int = 900) -> Image.Image | None:
+    with open(COMFY_WORKFLOW_FILE, "r", encoding="utf-8") as f:
+        workflow = json.load(f)
+
+    # 1) set prompt + input image
+    workflow["88"]["inputs"]["value"] = final_prompt
+    workflow["9"]["inputs"]["image"] = COMFY_INPUT_IMAGE
+    # 2) set target size on node 40 (BEFORE queueing!)
+    workflow["40"]["inputs"]["aspect_ratio"] = "custom"
+    workflow["40"]["inputs"]["proportional_width"] = int(width)
+    workflow["40"]["inputs"]["proportional_height"] = int(height)
+
+    # keep existing fit/method/scale_to_side as-is; just avoid black bars
+    workflow["40"]["inputs"]["background_color"] = "#F5F5F5"
+
+    # node 40 reads scale_to_length from node 35, so keep long-side limit consistent
+    workflow["35"]["inputs"]["value"] = int(max(width, height))
+
+    #print(f"COMFY POST -> {COMFY_URL}/prompt", flush=True)
+    #print(f"COMFY workflow file -> {COMFY_WORKFLOW_FILE}", flush=True)
+
+    # 3) queue
+    workflow = randomize_workflow_seeds(workflow)
+    data, media_type = runner_wallpaper(workflow)
+    if media_type != "image/png":
+        raise RuntimeError("Runner wallpaper artifact must be PNG")
+    return Image.open(io.BytesIO(data)).convert("RGB")
+
+
+def draw_multiline(draw: ImageDraw.ImageDraw, xy, text: str, font, fill, line_spacing: int = 8):
+    x, y = xy
+    for line in text.splitlines():
+        draw.text((x, y), line, font=font, fill=fill)
+        y += font.size + line_spacing
+
+# -------- WALLPAPER RENDER --------
+def render_wallpaper(path: str):
+    W, H = 1600, 1200
+    img = Image.new("RGB", (W, H), (245, 245, 245))
+    d = ImageDraw.Draw(img)
+
+    pad = 15
+    top_h = int(H * 0.70)
+
+    pic_w = int((W - pad*3) * 0.70)
+    cal_w = (W - pad*3) - pic_w
+
+    pic = (pad, pad, pad + pic_w, pad + top_h)
+    cal = (pad*2 + pic_w, pad, W - pad, pad + top_h)
+    todo = (pad, pad*2 + top_h, W - pad, H - pad)
+
+    def box(rect, title: str | None):
+        # Border only (black)
+        d.rounded_rectangle(rect, radius=18, fill=(245,245,245), outline=(0,0,0), width=6)
+        if title:
+            d.text((rect[0] + 28, rect[1] + 20), title, font=load_font(44), fill=(0, 0, 0))
+
+    # No titles in these boxes (you requested removing Calendar label)
+    box(cal, None)
+    box(pic, None)
+    box(todo, None)
+
+    now = datetime.now().strftime("%a %b %d %H:%M:%S %Z %Y")
+
+    # -------- Weather / Prompt / Picture generation (unchanged) --------
+    w = ha_get_state(WEATHER_ENTITY)
+    weather_line = format_weather_for_display(w)
+
+    base_prompt = BASE_IMAGE_PROMPT
+
+    tod = infer_day_or_night_from_weather(w)
+    season = infer_season(w)
+
+    overlay = ollama_generate_overlay(weather_line, tod)
+    season_block = ollama_generate_season_block(season, tod, weather_line)
+
+    if not overlay.strip():
+        print("[weather] Ollama overlay returned empty; using deterministic fallback", flush=True)
+        overlay = (
+            "WEATHER OVERLAY:\n"
+            f"Sky: {tod} sky matching {weather_line}\n"
+            f"Air: humid outdoor air with current {weather_line}\n"
+            "Ground: trackside ballast and forest floor reflect current conditions\n"
+            "LanternLight: lantern glow catches moisture and nearby surfaces"
+        )
+
+    if not season_block.strip():
+        print("[season] Ollama season block returned empty; using deterministic fallback", flush=True)
+        season_block = (
+            "SEASONAL ENVIRONMENT:\n"
+            f"Trees: summer woods with full leafy branches around the scene\n"
+            "Ground: dense summer undergrowth beside the ballast and switch stand\n"
+            f"Air: warm humid {tod} atmosphere with soft depth\n"
+            "DistantDetails: dark green foliage fades into the background"
+        )
+
+    temp_c, precip, intensity, icy = extract_clothing_weather_inputs(w)
+    clothing_profile = choose_clothing_profile(temp_c, precip, intensity, icy)
+
+    clothing_block = build_clothing_block(clothing_profile)
+
+    final_prompt = build_final_prompt(
+        base_prompt,
+        overlay,
+        season_block,
+        clothing_block,
+    )
+    final_prompt = clean_for_json(final_prompt)
+
+    title_font = load_font(60)
+    meta_font = load_font(34)
+    small_font = load_font(28)
+
+#    d.text((W // 2 - 520, H // 2 - 120), "WALLPAPER PIPELINE TEST", font=title_font, fill=(245, 245, 245))
+#    d.text((W // 2 - 360, H // 2 - 20), now, font=meta_font, fill=(220, 220, 220))
+#    d.text((W // 2 - 700, H // 2 + 35), weather_line, font=small_font, fill=(210, 210, 210))
+#    draw_multiline(d, (W // 2 - 700, H // 2 + 80), overlay, font=small_font, fill=(205, 205, 205), line_spacing=8)
+
+    picture = None
+    stage_event('wallpaper', 'running')
+    try:
+    # inner area
+        inner_pad = 16
+        x0, y0, x1, y1 = pic
+        x0 += inner_pad
+        y0 += inner_pad
+        x1 -= inner_pad
+        y1 -= inner_pad
+        box_w, box_h = (x1 - x0), (y1 - y0)
+
+        picture = comfy_render_image(final_prompt, width=box_w, height=box_h)
+        if not isinstance(picture, Image.Image):
+            raise ValueError('invalid_wallpaper_image')
+        stage_event('wallpaper', 'success')
+    except CoordinationError as exc:
+        stage_event('wallpaper', 'uncertain', 'runner_uncertain', exc)
+        raise
+    except Exception as exc:
+        stage_event('wallpaper', 'fallback', failure_reason(exc, 'invalid_model_output'), exc)
+        draw_multiline(d, (pic[0] + 26, pic[1] + 26), 'Wallpaper generation failed. See render status.',
+                       font=load_font(24), fill=(180, 30, 30), line_spacing=8)
+
+    if picture:
+    # picture should already be exact size; paste directly
+        img.paste(picture, (x0, y0))
+
+    # -------- Calendar rendering (NEW) --------
+    # Fonts tuned for your narrow calendar panel
+    cal_header_font = load_font(28)  # "March 2026"
+    day_num_font = load_font(22)     # 1,2,3...
+    evt_font = load_font(18)
+    print("FONT_SIZES calendar:", cal_header_font.size, day_num_font.size, evt_font.size, flush=True)
+ #   print("fonts:", getattr(cal_header_font, "size", None),
+ #                 getattr(day_num_font, "size", None),
+ #                 getattr(evt_font, "size", None))
+    cx0, cy0, cx1, cy1 = cal
+    inner_x = 26
+
+    # Header month/year (always long month, as requested)
+    now_local = datetime.now().astimezone()
+    month_header = now_local.strftime("%B %Y")  # "March 2026"
+    header_w = d.textlength(month_header, font=cal_header_font)
+    header_x = cx0 + ((cx1 - cx0) - header_w) / 2
+
+    draw_text_bold(d, (header_x, cy0 + 18), month_header,
+                   font=cal_header_font, fill=(40,40,40),
+                   stroke_fill=(60,60,60), stroke_width=1)
+
+    # Grab events from HA (we'll ask for ~5 days ahead so we can show 3-5 days)
+    events = []
+    cal_err = None
+    try:
+        today0 = datetime.now().astimezone().replace(hour=0, minute=0, second=0, microsecond=0)
+        end_dt = today0 + timedelta(days=5)
+
+        raw = ha_calendar_get_events_range(CALENDAR_ENTITY, today0, end_dt)
+        sr = (raw or {}).get("service_response") or {}
+        cal_obj = sr.get(CALENDAR_ENTITY) or {}
+        events = cal_obj.get("events") or []
+        if not isinstance(events, list):
+            events = []
+    except Exception as e:
+        cal_err = str(e)
+
+    def _group_events_by_day(evts: list[dict]):
+        buckets = {}
+        for e in evts:
+            summary = (e.get("summary") or "(no title)").strip()
+            start = e.get("start") or ""
+            day, tstr, all_day = _parse_event_start(start)
+            if day is None:
+                continue
+            buckets.setdefault(day, []).append({"time": tstr, "summary": summary, "all_day": all_day})
+
+        # timed first, then all-day (agenda feel)
+        for day, items in buckets.items():
+            def key(it):
+                if it["time"] is None:
+                    return (1, "99:99", it["summary"].lower())
+                return (0, it["time"], it["summary"].lower())
+            items.sort(key=key)
+
+        return [(d0, buckets[d0]) for d0 in sorted(buckets.keys())]
+
+    # Where content begins under the header
+    y = cy0 + 90
+    max_w = (cx1 - cx0) - inner_x * 2
+
+    if cal_err:
+        d.text((cx0 + inner_x, y), f"Calendar error: {cal_err[:120]}", font=evt_font, fill=(230, 180, 180))
+    else:
+        # ---- Build buckets: date -> list of items ----
+        today = datetime.now().astimezone().date()
+        days_to_show = 5
+        max_events_per_day = 5
+
+        buckets = {}
+        for e in events:
+            summary = (e.get("summary") or "(no title)").strip()
+            start = e.get("start") or ""
+            day, tstr, all_day = _parse_event_start(start)
+            if day is None:
+                continue
+            buckets.setdefault(day, []).append({"time": tstr, "summary": summary, "all_day": all_day})
+
+        # timed first, then all-day
+        for day, items in buckets.items():
+            def key(it):
+                if it["time"] is None:
+                    return (1, "99:99", it["summary"].lower())
+                return (0, it["time"], it["summary"].lower())
+            items.sort(key=key)
+
+        # ---- Render consecutive days, even if empty ----
+        # ----- Fixed-slot day layout -----
+        days_to_show = 5
+        max_events_per_day = 3  # tune if you want
+
+# vertical region available for day blocks
+        header_top = cy0 + 18
+        header_height = cal_header_font.size + 18
+        content_top = header_top + header_height + 18
+        content_bottom = cy1 - 18
+
+        slot_h = (content_bottom - content_top) / days_to_show
+
+        today = datetime.now().astimezone().date()
+
+        for i in range(days_to_show):
+            day = today + timedelta(days=i)
+            items = buckets.get(day, [])
+
+            slot_y0 = int(content_top + i * slot_h)
+            slot_y1 = int(content_top + (i + 1) * slot_h)
+
+    # baseline positions within slot
+            y_num = slot_y0
+            y_line = y_num + day_num_font.size + 8
+            y_text = y_line + 10
+
+# day number (bold)
+            draw_text_bold(
+                d, (cx0 + inner_x, y_num), str(day.day),
+                font=day_num_font, fill=(14, 14, 14),
+                stroke_width=1, stroke_fill=(60, 60, 60)
+            )
+
+# weekday initials (e.g. "Sun")
+            dow = day.strftime("%a")  # Sun/Mon/Tue...
+            dow_font = evt_font       # or load_font(evt_font.size) if you prefer separate
+            num_text = str(day.day)
+            num_w = d.textlength(num_text, font=day_num_font)
+            dow_x = cx0 + inner_x + int(num_w) + 14  # space to the right of the big number
+            dow_y = y_num + int(day_num_font.size * 0.25)
+
+            draw_text_bold(
+                d, (dow_x, dow_y), dow,
+                font=dow_font, fill=(60, 60, 60),
+                stroke_width=1
+            )
+    # day number
+            #draw_text_bold(d, (cx0 + inner_x, y_num), str(day.day),
+            #               font=day_num_font, fill=(14, 14, 14), stroke_width=1, stroke_fill=(60,60,60))
+
+    # divider
+            d.line((cx0 + inner_x, y_line, cx1 - inner_x, y_line), fill=(30, 30, 30), width=3)
+
+    # how many text lines fit in this slot?
+            line_h = evt_font.size + 6
+            max_lines_in_slot = max(1, (slot_y1 - y_text - 8) // line_h)
+
+    # build display lines
+            lines = []
+            if not items:
+                lines = ["• Nothing planned"]
+            else:
+                for it in items:
+                    if it["time"]:
+                        lines.append(f"• {it['time']}  {it['summary']}")
+                    else:
+                        lines.append(f"• {it['summary']}")
+
+    # wrap + flatten (so long titles wrap but still respect max lines)
+            wrapped_lines = []
+            for line in lines:
+                wrapped_lines.extend(wrap_text(d, line, evt_font, max_w))
+
+    # truncate if needed
+            if len(wrapped_lines) > max_lines_in_slot:
+                wrapped_lines = wrapped_lines[:max_lines_in_slot]
+        # optional: replace last line with "+ more…" indicator
+                if items:
+                    wrapped_lines[-1] = "• + more…"
+
+            draw_wrapped_lines(d, cx0 + inner_x, y_text, wrapped_lines,
+                               evt_font, (14, 14, 14), max_lines=max_lines_in_slot, line_gap=6)
+
+        if not events:
+            d.text((cx0 + inner_x, cy0 + 110), "No upcoming events", font=evt_font, fill=(210, 210, 210))
+
+    # -------- To-do (leave empty for now) --------
+
+    # -------- To-do (Daily) --------
+    tx0, ty0, tx1, ty1 = todo
+    t_inner = 26
+
+    todo_header_font = load_font(18)
+    todo_font = evt_font
+    todo_header = "Daily To-Do"
+
+    tw = d.textlength(todo_header, font=todo_header_font)
+    tx = tx0 + ((tx1 - tx0) - tw) / 2
+
+    draw_text_bold(
+        d, (tx, ty0 + 18), todo_header,
+        font=todo_header_font, fill=(40,40,40),
+        stroke_fill=(60,60,60), stroke_width=1
+    )
+
+    line_y = ty0 + 18 + todo_header_font.size + 10
+    d.line((tx0 + t_inner, line_y, tx1 - t_inner, line_y), fill=(30,30,30), width=3)
+
+    y = line_y + 14
+    max_w = (tx1 - tx0) - t_inner * 2
+    indicator = recovery_indicator_layout(d, todo, _RECOVERY_STATUS.read())
+    def task_width(row_y):
+        return todo_text_width(row_y, todo_font, tx0 + t_inner, max_w, indicator)
+
+    # Try cached AI lines first (cheap)
+    with TODO_AI_LOCK:
+        ai_lines = list(TODO_AI_CACHE.get("lines") or []) if TODO_AI_CACHE.get("day") == toronto_day() else []
+        ai_summary = (TODO_AI_CACHE.get("summary_line") or "").strip()
+        quote_idx = TODO_AI_CACHE.get("quote_idx")
+
+    if ai_lines:
+        stage_event('todo', 'cached' if TODO_AI_CACHE.get('hash') else 'fallback',
+                    None if TODO_AI_CACHE.get('hash') else 'invalid_model_output')
+    # Quote appears on visible line 5 (idx 4) only when we inserted it:
+    # buffer line (idx 3) blank + idx 4 non-empty
+        ai_lines, quote_idx = todo_display_rows(ai_lines)
+
+        prev_was_task = False
+
+        for idx, ln in enumerate(ai_lines[:6]):
+            ln = (ln or "").strip()
+            if is_effectively_blank_line(ln):
+                prev_was_task = False
+                y += (todo_font.size + 6) + 10
+                continue
+
+        # address line gets no bullet and is indented
+            if prev_was_task and looks_like_address_line(ln):
+                txt = clamp_to_width(d, "  " + ln, todo_font, task_width(y))
+                d.text((tx0 + t_inner, y), txt, font=todo_font, fill=(14,14,14))
+                prev_was_task = False
+            else:
+            # quote line has no bullet ONLY if we actually inserted a quote there
+                prefix = "" if (quote_idx == idx) else "• "
+                txt = clamp_to_width(d, f"{prefix}{ln}", todo_font, task_width(y))
+                d.text((tx0 + t_inner, y), txt, font=todo_font, fill=(14,14,14))
+                prev_was_task = True
+
+            y += (todo_font.size + 6) + 10
+            if y > ty1 - 40:
+                break
+
+    # Reserved line 7
+        if ai_summary and y <= ty1 - 30:
+            d.text((tx0 + t_inner, y), clamp_to_width(d, ai_summary, todo_font, task_width(y)), font=todo_font, fill=(80,80,80))
+
+    else:
+        # Fallback to raw (your current behavior)
+        items = ha_todo_get_items(TODO_ENTITY)
+        open_raw = []
+        for it in items:
+            status = (it.get("status") or "").lower()
+            if status == "completed":
+                continue
+            raw = (it.get("summary") or it.get("item") or "").strip()
+            if raw:
+                open_raw.append(raw)
+
+        parsed = [parse_task_key_and_text(s) for s in open_raw]
+        parsed.sort(key=lambda x: (x[0], x[1], x[2].lower()))
+        open_display = [p[2] for p in parsed if p[2]]
+
+        MAX_SHOW = 6
+        shown = open_display[:MAX_SHOW]
+        remaining = max(0, len(open_display) - MAX_SHOW)
+
+        if not shown:
+            shown = ["Nothing planned"]
+
+        shown, quote_idx = todo_display_rows(shown)
+        for idx, text in enumerate(shown):
+            if not text:
+                y += (todo_font.size + 6) + 10
+                continue
+            line = text if idx == quote_idx else f"• {text}"
+            wrapped = wrap_text(d, line, todo_font, task_width(y))
+            wrapped = [clamp_to_width(d, text, todo_font, task_width(y)) for text in wrapped[:1]]
+            draw_wrapped_lines(d, tx0 + t_inner, y, wrapped, todo_font, (14,14,14), max_lines=1, line_gap=6)
+            y += (todo_font.size + 6) + 10
+            if y > ty1 - 40:
+                break
+
+        if remaining > 0 and y <= ty1 - 30:
+            d.text((tx0 + t_inner, y), clamp_to_width(d, f"+{remaining} more…", todo_font, task_width(y)), font=todo_font, fill=(80,80,80))
+
+    draw_recovery_indicator(d, indicator)
+
+    # -------- Save Image --------
+    img.save(path, "PNG")
+
+# -------- JOB RUNNER --------
+_OUTPUT_SLOT = None
+
+def _output_slot():
+    global _OUTPUT_SLOT
+    if _OUTPUT_SLOT is None:
+        _OUTPUT_SLOT = OutputSlot(os.environ.get("GPU_RUNNER_CLIENT_STATE", "/var/lib/dashboard-gpu-client"),
+                                  [OUT_PATH, os.path.join(os.path.dirname(OUT_PATH), "image_data.bin")])
+    return _OUTPUT_SLOT
+
+def _reserve_output(kind, request_id=None):
+    global JOB_RUNNING, LAST_JOB
+    with JOB_LOCK:
+        try:
+            operation = _output_slot().begin(kind, request_id if isinstance(request_id, str) else None)
+        except OutputBusy as exc:
+            reason = exc.reason if isinstance(exc, DispatchBlocked) else "output_operation_busy"
+            raise HTTPException(status_code=409 if reason == "output_operation_busy" else 503,
+                detail={"status": "busy" if reason == "output_operation_busy" else "unable_to_submit",
+                        "queued": False, "reason": reason,
+                        "operator_required": getattr(exc, "operator_required", False)}) from None
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid X-Request-ID")
+        except CoordinationError as exc:
+            raise HTTPException(status_code=503, detail='output_operation_unavailable_no_replay')
+        if not operation.cached:
+            JOB_RUNNING = True
+            LAST_JOB = _operation_status(operation.record)
+        return operation
+
+def _operation_status(record):
+    result = {key: record[key] for key in ('status', 'started', 'finished', 'request_id') if key in record}
+    result['error'] = 'operation_failed' if record.get('error') else None
+    if record.get('details', {}).get('pipeline'):
+        result.update(pipeline_summary(record, failed=record.get('status') == 'error'))
+    return result
+
+def _finish_output(operation, response=None, error=None):
+    global JOB_RUNNING, LAST_JOB
+    try:
+        if error is not None:
+            error = abort_pipeline(operation, error)
+        if response is not None:
+            response.update(pipeline_summary(dict(operation.record, status='ok')))
+        operation.finish(response, error)
+    finally:
+        if operation.lock is not None:
+            operation.lock.close()
+            operation.lock = None
+        with JOB_LOCK:
+            JOB_RUNNING = False
+            LAST_JOB = _operation_status(operation.record)
+
+def _run_render_job(operation):
+    token = CURRENT_OPERATION.set(operation)
+    try:
+        response = _render_body()
+        response.update(queued=False, status='ok')
+        _finish_output(operation, response)
+    except Exception as exc:
+        _finish_output(operation, error=exc)
+    finally:
+        CURRENT_OPERATION.reset(token)
+
+# -------- API --------
+@app.post("/todo_ai_refresh")
+def todo_ai_refresh():
+    items_open = _todo_items_open_sorted(TODO_ENTITY)
+    h = _stable_todo_hash(items_open)
+
+    today = toronto_day()
+
+    with TODO_AI_LOCK:
+        if TODO_AI_CACHE["hash"] == h and TODO_AI_CACHE.get("day") == today:
+            cached_lines = list(TODO_AI_CACHE['lines'])
+        else:
+            cached_lines = None
+    if cached_lines is not None:
+        shown, _ = todo_display_rows(cached_lines)
+        return {"ok": True, "changed": False, "hash": h, "cached": True, "lines": shown}
+
+    # Not cached → run ollama
+    formatted = ollama_format_todo(items_open)
+
+    # Build EXACTLY 7 lines: 1-6 visible, 7 summary
+    lines = list(formatted.get("lines") or [])[:6]
+    while len(lines) < 6:
+        lines.append("")
+    lines.append((formatted.get("summary_line") or "").strip())  # line 7
+
+    # Clean fake blank placeholders like "—" or "-"
+    lines = [("" if is_effectively_blank_line(ln) else ln) for ln in lines]
+
+    # If the model accidentally put a "+N more" line in the first 6 lines, move it to line 7.
+    for i in range(6):
+        if lines[i].lstrip().startswith("+") and "more" in lines[i].lower():
+            lines[6] = lines[i].strip()
+            lines[i] = ""
+            break
+
+    lines[:6] = ([ln for ln in lines[:6] if not is_effectively_blank_line(ln)] + [''] * 6)[:6]
+
+    # If line 7 is empty, synthesize it.
+    if not lines[6].strip():
+        lines[6] = "+0 more — no more tasks"
+
+    with TODO_AI_LOCK:
+        TODO_AI_CACHE["hash"] = None if formatted.get("fallback") else h
+        TODO_AI_CACHE["lines"] = lines[:6]
+        TODO_AI_CACHE["summary_line"] = lines[6]
+        TODO_AI_CACHE["ts"] = int(time.time())
+        TODO_AI_CACHE["day"] = today
+
+    lines[:6], _ = todo_display_rows(lines[:6])
+    return {
+        "ok": True,
+        "changed": True,
+        "hash": h,
+        "lines": lines[:6],
+        "summary": lines[6],
+    }
+
+@app.post("/render_test")
+def render_test(request_id: str | None = Header(None, alias="X-Request-ID")):
+    operation = _reserve_output("render-test", request_id)
+    if operation is None:
+        return {"ok": True, "queued": False, "status": "busy"}
+    if operation.cached:
+        return operation.record["response"]
+    token = CURRENT_OPERATION.set(operation)
+    try:
+        response = _render_test_body()
+        _finish_output(operation, response)
+        return response
+    except Exception as exc:
+        _finish_output(operation, error=exc)
+        raise
+    finally:
+        CURRENT_OPERATION.reset(token)
+
+def _render_test_body():
+    """
+    Fast test path:
+    - does NOT call HA
+    - does NOT call Ollama
+    - does NOT call Comfy
+    - just converts the existing wallpaper and pushes it to the EPD
+    """
+    try:
+        return push_existing_wallpaper_to_epd()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="dashboard_operation_failed") from None
+
+@app.post("/todo_generate_today")
+def todo_generate_today():
+    try:
+        ev = calendar_events_today(CALENDAR_ENTITY)
+        tasks = build_tasks_from_events(ev)
+
+        removed = ha_todo_clear_list(TODO_ENTITY)
+
+        for t in tasks:
+            ha_todo_add_item(
+                TODO_ENTITY,
+                t["summary"],
+                due_date=t.get("due_date"),
+                due_datetime=t.get("due_datetime"),
+                description=t.get("description"),
+            )
+
+        return {
+            "ok": True,
+            "calendar": CALENDAR_ENTITY,
+            "todo": TODO_ENTITY,
+            "removed": removed,
+            "added": len(tasks),
+            "tasks": tasks,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="dashboard_operation_failed") from None
+
+@app.post("/render_async")
+def render_async(background_tasks: BackgroundTasks, request_id: str | None = Header(None, alias="X-Request-ID")):
+    operation = _reserve_output("render-async", request_id)
+    if operation is None:
+        return {"ok": True, "queued": False, "status": "busy"}
+    if operation.cached:
+        return dict(operation.record["response"], cached=True, queued=False,
+                    request_id=operation.request_id, status="completed",
+                    status_url="/render_status?request_id=" + operation.request_id)
+    try:
+        background_tasks.add_task(_run_render_job, operation)
+    except Exception as exc:
+        _finish_output(operation, error=exc)
+        raise
+    return {"ok": True, "queued": True, "status": "queued", "cached": False,
+            "request_id": operation.request_id, "status_url": "/render_status?request_id=" + operation.request_id}
+
+
+@app.post("/render_test_path")
+def render_test_path(path: str, request_id: str | None = Header(None, alias="X-Request-ID")):
+    operation = _reserve_output("render-test-path:" + os.path.realpath(path), request_id)
+    if operation is None:
+        return {"ok": True, "queued": False, "status": "busy"}
+    if operation.cached:
+        return operation.record["response"]
+    token = CURRENT_OPERATION.set(operation)
+    try:
+        response = _render_test_path_body(path)
+        _finish_output(operation, response)
+        return response
+    except Exception as exc:
+        _finish_output(operation, error=exc)
+        raise
+    finally:
+        CURRENT_OPERATION.reset(token)
+
+def _render_test_path_body(path: str):
+    try:
+        if not os.path.exists(path):
+            raise FileNotFoundError('wallpaper_not_found')
+        stage_event('composition', 'cached')
+        response = _convert_and_deliver(path)
+        response['source'] = path
+        return response
+    except Exception:
+        raise HTTPException(status_code=500, detail='dashboard_operation_failed') from None
+
+@app.get("/render_status")
+def render_status(request_id: str | None = None):
+    with JOB_LOCK:
+        try:
+            record = (_output_slot().operation_status(request_id) if request_id is not None
+                      else _output_slot().status())
+        except ValueError:
+            raise HTTPException(status_code=400, detail='invalid_request_id') from None
+        if record is None:
+            raise HTTPException(status_code=404, detail='operation_not_found')
+        last = _operation_status(record)
+        status = public_operation(record)
+        return {"ok": status != "failed", "running": status == "running", "status": status,
+                "request_id": record.get("request_id"), "last": last,
+                "succeeded": status == "completed", "fully_successful": bool(last.get("fully_successful", status == "completed")),
+                "dispatch": _output_slot().health(refresh=True)}
+
+
+def dispatch_status():
+    try:
+        return _output_slot().health(refresh=True)
+    except Exception:
+        return {"dispatch_status": "unavailable", "reason": "reconciliation_storage_unavailable", "operator_required": True}
+
+@app.post("/render")
+def render(request_id: str | None = Header(None, alias="X-Request-ID")):
+    operation = _reserve_output("render", request_id)
+    if operation is None:
+        return {"ok": True, "queued": False, "status": "busy"}
+    if operation.cached:
+        return operation.record["response"]
+    token = CURRENT_OPERATION.set(operation)
+    try:
+        response = _render_body()
+        _finish_output(operation, response)
+        return response
+    except Exception as exc:
+        _finish_output(operation, error=exc)
+        raise
+    finally:
+        CURRENT_OPERATION.reset(token)
+
+def _render_body():
+    os.makedirs(os.path.dirname(OUT_PATH), exist_ok=True)
+    stage_event('composition', 'running')
+    render_wallpaper(OUT_PATH)
+    stage_event('composition', 'success')
+    response = _convert_and_deliver(OUT_PATH)
+    response.update(out=OUT_PATH, weather_entity=WEATHER_ENTITY, ollama_model=OLLAMA_MODEL)
+    return response
+
+
+def _convert_and_deliver(png_path):
+    bin_path = os.path.join(os.path.dirname(OUT_PATH), 'image_data.bin')
+    stage_event('conversion', 'running')
+    n = generate_epaper_bin_epdoptimize(png_path, bin_path)
+    if n != BIN_BYTES_EXPECTED:
+        stage_event('conversion', 'failed', 'conversion_failed')
+        raise HTTPException(status_code=500, detail='binary_conversion_failed')
+    stage_event('conversion', 'success')
+    pushed, push_error = 'disabled', None
+    if EPD_PUSH_ENABLED:
+        stage_event('delivery', 'running')
+        try:
+            push_bin_to_epd(bin_path)
+            pushed = 'ok'
+            stage_event('delivery', 'success')
+        except Exception as exc:
+            push_error = delivery_reason(exc)
+            stage_event('delivery', 'failed', push_error)
+            if EPD_PUSH_FAIL_HARD:
+                raise HTTPException(status_code=500, detail='EPD delivery failed') from None
+            pushed = 'failed_soft'
+    else:
+        stage_event('delivery', 'skipped', 'delivery_disabled')
+    response = {'ok': True, 'bin': bin_path, 'bin_bytes': n, 'epd_push': pushed}
+    if push_error: response['epd_push_error'] = push_error
+    return response
+
+@app.get("/health")
+def health():
+    return {"ok": True}
