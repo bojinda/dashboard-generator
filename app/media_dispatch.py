@@ -1,12 +1,14 @@
 """Media output admission/reconciliation only. Never submits or retries GPU jobs."""
 import hashlib
 import json
+import os
 import re
+import stat
 import time
 from pathlib import Path
 
 from aihub_gpu_runner.client import APITransport, CoordinationError, OutputBusy, OutputSlot
-from aihub_gpu_runner.core import NativeLock, check_id, encode, timestamp
+from aihub_gpu_runner.core import NativeLock, check_id, encode, strict_json, timestamp
 
 REASONS = {'output_operation_busy', 'runner_unavailable', 'runner_maintenance',
            'runner_owner_reconciling', 'runner_owner_unverified',
@@ -33,6 +35,38 @@ class DispatchOutputSlot(OutputSlot):
         super().__init__(*args, **kwargs)
         self.transport = transport
         self.clock, self.monotonic = clock, monotonic
+
+    @staticmethod
+    def _read_child(directory, name):
+        """Hash the real bytes without resolving the same ancestors per record.
+
+        Both directories come from AtomicStore.path, resolved once per scan.
+        Reject links and replacement during the read; this is not an mtime
+        cache. Every selected record and receipt is parsed again on each pass.
+        """
+        if Path(name).name != name:
+            raise ValueError('state_path_escape')
+        path = directory / name
+        try:
+            before = path.lstat()
+        except FileNotFoundError:
+            return None
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('non_regular_reconciliation_record')
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            opened = os.fstat(stream.fileno())
+            # Windows stat/fstat expose different ctime semantics on some
+            # Python versions. Compare the same API before/after for changes.
+            if (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino):
+                raise ValueError('reconciliation_record_changed')
+            data = stream.read()
+            if identity(os.fstat(stream.fileno())) != identity(opened):
+                raise ValueError('reconciliation_record_changed')
+        if identity(path.lstat()) != identity(before):
+            raise ValueError('reconciliation_record_changed')
+        return strict_json(data)
 
     def _get(self, route, deadline):
         import os
@@ -89,29 +123,87 @@ class DispatchOutputSlot(OutputSlot):
                 runner_binding=pending, outcome=outcome, proof=proof, reconciled_at=timestamp(),
                 replayed=False))
 
+    def _settled_receipt(self, record, job_id, pending):
+        """Read a bound proof, never infer settlement from a receipt's existence.
+
+        The output lock excludes writers for this scope. Original records remain
+        immutable; every pass hashes them again rather than trusting a timestamp
+        or a mutable scan cursor. Native current ownership is checked separately.
+        """
+        for outcome in ('terminal_released', 'not_submitted'):
+            key = hashlib.sha256(encode([self.scope, record['request_id'], job_id, pending, outcome])).hexdigest()
+            receipt = self._read_child(self._receipt_directory, key + '.json')
+            if receipt is None:
+                continue
+            valid = (isinstance(receipt, dict) and receipt.get('schema') == 1 and
+                receipt.get('scope') == self.scope and receipt.get('operation_id') == record['request_id'] and
+                receipt.get('operation_sha256') == hashlib.sha256(encode(record)).hexdigest() and
+                receipt.get('runner_request_id') == job_id and receipt.get('runner_binding') == pending and
+                receipt.get('outcome') == outcome and receipt.get('replayed') is False and
+                isinstance(receipt.get('reconciled_at'), str) and isinstance(receipt.get('proof'), dict))
+            proof = receipt.get('proof', {}) if isinstance(receipt, dict) else {}
+            if outcome == 'terminal_released':
+                valid = valid and (proof.get('request_id') == job_id and
+                    proof.get('request_hash') == pending['request_hash'] and proof.get('target') == pending['target'] and
+                    proof.get('state') in ('success', 'failed', 'cancelled') and
+                    proof.get('resources_released') is True and proof.get('supervision_active') is False)
+            else:
+                ended = record.get('finished') or record.get('started')
+                owners = proof.get('unrelated_owners')
+                valid = valid and (proof.get('exact_request_absent_twice') is True and
+                    proof.get('runner_ready') is True and proof.get('minimum_completed_client_age_seconds') == 60 and
+                    type(ended) in (int, float) and self.clock() - ended >= 60 and isinstance(owners, dict) and
+                    all(isinstance(o, dict) and o.get('job_id') != job_id for o in owners.values()))
+            if not valid:
+                raise DispatchBlocked('runner_job_identity_mismatch', operator_required=True)
+            return outcome
+        return None
+
     def reconcile_runner_jobs(self):
         """Existing output lock is held by begin. Only bounded authenticated GETs."""
         deadline = self.monotonic() + 3
         try:
-            self._ready(deadline)
-            paths = list(self.store.path('operations').glob('*.json'))
-            if len(paths) > 5000:raise DispatchBlocked('output_reconciliation_bound_exceeded', operator_required=True)
+            ready = self._ready(deadline)
+            current_owned_jobs = {owner['job_id'] for owner in ready['owners'].values()}
+            # Archive size is not a safety predicate. The existing total deadline
+            # still bounds disk/GET work; positive terminal receipts let later
+            # passes spend the query budget on references lacking final proof.
+            operation_directory = self.store.path('operations')
+            self._receipt_directory = self.store.path('dispatch-reconciliations')
+            paths = operation_directory.glob('*.json')
             count = 0
             reconciled = set()
+            historical_jobs = set()
             for path in paths:
                 if self.monotonic() >= deadline:raise DispatchBlocked('output_reconciliation_bound_exceeded')
-                record = self.store.read(str(path.relative_to(self.store.root)))
+                record = self._read_child(operation_directory, path.name)
+                if not isinstance(record, dict):
+                    raise DispatchBlocked('reconciliation_storage_unavailable', operator_required=True)
                 if record.get('scope') != self.scope:continue
                 check_id(record['request_id'])
+                if path.name != record['request_id'] + '.json':
+                    raise DispatchBlocked('runner_job_identity_mismatch', operator_required=True)
                 if record.get('status') == 'running' and not record.get('runner_jobs'):
                     self._receipt(record, None, {}, 'abandoned_before_submission', {'output_lock_exclusive': True})
                 for job_id, pending in record.get('runner_jobs', {}).items():
+                    historical_jobs.add(job_id)
+                    if job_id in current_owned_jobs:
+                        # A historical receipt can never authorize a job which
+                        # the native authority currently says still owns a GPU.
+                        raise DispatchBlocked('previous_runner_job_unresolved', operator_required=True)
                     if pending.get('settled') is True:continue
-                    count += 1
-                    if count > 8:raise DispatchBlocked('output_reconciliation_bound_exceeded', operator_required=True)
                     check_id(job_id)
                     if pending.get('target') not in ('ollama', 'wallpaper') or not isinstance(pending.get('request_hash'), str) or re.fullmatch('[a-f0-9]{64}', pending['request_hash']) is None:
                         raise DispatchBlocked('runner_job_identity_mismatch', operator_required=True)
+                    receipt_outcome = self._settled_receipt(record, job_id, pending)
+                    if receipt_outcome == 'terminal_released':
+                        reconciled.add(record['request_id'])
+                        continue
+                    # A historical 404 is not an immutable native disposition.
+                    # Revalidate absence (or a later exact native job) on every
+                    # pass using the original bounded GET/age/ownership proof.
+                    if count >= 8:raise DispatchBlocked('output_reconciliation_bound_exceeded')
+                    count += 1
                     code, status = self._get('/jobs/' + job_id, deadline)
                     if code == 404:
                         # Never replay the old operation. Only admit a DIFFERENT later
@@ -138,6 +230,11 @@ class DispatchOutputSlot(OutputSlot):
                         self._receipt(record, job_id, pending, 'terminal_released', status)
                     else:raise DispatchBlocked('runner_unavailable')
                     reconciled.add(record['request_id'])
+            # Admission is based on current ownership, even if all referenced
+            # historical jobs were already verified by earlier passes.
+            final = self._ready(deadline)
+            if any(owner['job_id'] in historical_jobs for owner in final['owners'].values()):
+                raise DispatchBlocked('previous_runner_job_unresolved', operator_required=True)
             self.store.write('dispatch-health.json', dict(schema=1, status='ready', reason=None,
                 operator_required=False, checked_at=timestamp(), checked_at_unix=self.clock(),
                 pending_references_checked=count, reconciled_operations=sorted(reconciled)))

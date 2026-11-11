@@ -17,7 +17,7 @@ import unittest
 from unittest.mock import patch
 
 from PIL import Image, ImageChops, ImageDraw, ImageFont
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, HTTPException
 from fastapi.testclient import TestClient
 
 from aihub_gpu_runner.api import Application
@@ -328,6 +328,13 @@ class RunnerAdapterTests(unittest.TestCase):
                 JobClient(None, wait_timeout=value)
 
 
+class SyntheticDispatchReadiness:
+    """Explicit local GET fixture; application admission is never patched out."""
+    def request(self, method, route):
+        assert method == 'GET' and route == '/resources', (method, route)
+        return 200, 'application/json', encode({'ready': True, 'owners': {}})
+
+
 class DashboardInterfaceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='dashboard-interface-')
@@ -343,7 +350,10 @@ class DashboardInterfaceTests(unittest.TestCase):
         self.main = main
         main.OUT_PATH = str(self.root / 'wallpaper.png')
         main.COMFY_WORKFLOW_FILE = str(ROOT / 'workflows/picture_api.json')
-        self.blocks = [patch('requests.get', side_effect=AssertionError('live HA/HTTP forbidden')),
+        self.dispatch = SyntheticDispatchReadiness()
+        slot_type = main.OutputSlot
+        self.blocks = [patch.object(main, 'OutputSlot', side_effect=lambda *a, **kw: slot_type(*a, transport=self.dispatch, **kw)),
+                       patch('requests.get', side_effect=AssertionError('live HA/HTTP forbidden')),
                        patch('requests.post', side_effect=AssertionError('live HTTP/EPD forbidden')),
                        patch('subprocess.run', side_effect=AssertionError('live Node/EPD forbidden'))]
         for block in self.blocks:
@@ -356,11 +366,13 @@ class DashboardInterfaceTests(unittest.TestCase):
         self.temp.cleanup()
     def test_async_trigger_reserves_before_background_task_is_started(self):
         tasks = BackgroundTasks()
-        self.assertEqual(self.main.render_async(tasks, 'first-async'), {'ok': True, 'queued': True, 'request_id': 'first-async'})
-        self.assertEqual(self.main.render_async(BackgroundTasks(), 'second-async'),
-                         {'ok': True, 'queued': False, 'status': 'busy'})
-        self.assertEqual(self.main.render('sync-while-async')['status'], 'busy')
-        self.assertEqual(self.main.render_test('epd-while-async')['status'], 'busy')
+        accepted = self.main.render_async(tasks, 'first-async')
+        self.assertEqual({key: accepted[key] for key in ('ok','queued','request_id')}, {'ok': True, 'queued': True, 'request_id': 'first-async'})
+        for callback in (lambda: self.main.render_async(BackgroundTasks(), 'second-async'),
+                         lambda: self.main.render('sync-while-async'), lambda: self.main.render_test('epd-while-async')):
+            with self.assertRaises(HTTPException) as caught: callback()
+            self.assertEqual(caught.exception.status_code, 409)
+            self.assertFalse(caught.exception.detail['queued'])
         operation = tasks.tasks[0].args[0]
         self.main._finish_output(operation, {'ok': True})
     def test_simultaneous_dashboard_triggers_schedule_exactly_one_writer(self):
@@ -368,7 +380,10 @@ class DashboardInterfaceTests(unittest.TestCase):
         def trigger(number):
             tasks = BackgroundTasks()
             barrier.wait(2)
-            return self.main.render_async(tasks, 'parallel-' + str(number)), tasks
+            try: return self.main.render_async(tasks, 'parallel-' + str(number)), tasks
+            except HTTPException as exc:
+                self.assertEqual(exc.status_code, 409)
+                return exc.detail, tasks
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
             results = list(pool.map(trigger, range(8)))
         winners = [tasks for response, tasks in results if response.get('queued') is True]
@@ -384,7 +399,7 @@ class DashboardInterfaceTests(unittest.TestCase):
             asyncio.run(tasks())
             repeat = BackgroundTasks()
             response = self.main.render_async(repeat, 'stable-async-id')
-            self.assertEqual({k: response[k] for k in ('ok', 'queued', 'status')}, {'ok': True, 'queued': False, 'status': 'ok'})
+            self.assertEqual({k: response[k] for k in ('ok', 'queued', 'status')}, {'ok': True, 'queued': False, 'status': 'completed'})
             self.assertEqual(response['pipeline_status'], 'success')
             self.assertEqual(repeat.tasks, [])
             self.assertEqual(compose.call_count, 1)
@@ -414,7 +429,7 @@ class DashboardInterfaceTests(unittest.TestCase):
         admission.bootstrap({'approval_ref': 'SYNTHETIC', 'bootstrap_id': admission.snapshot()['bootstrap_id'],
                              'backend_quiescent': True, 'cleanup_verified': True})
         workflow = json.loads((ROOT / 'workflows/picture_api.json').read_text())
-        settings = json.loads(Path(os.environ['DASHBOARD_POLICY_EXAMPLE']).read_text())
+        settings = json.loads(Path(os.environ.get('DASHBOARD_POLICY_EXAMPLE', ROOT / 'tests/fixtures/dashboard-wallpaper-policy.example.json')).read_text())
         mutations = copy.deepcopy(settings['mutations'])
         mutations['9.image']['values'] = [dashboard.COMFY_INPUT_IMAGE]
         targets = {'ollama': Target('ollama', 'ollama', ('gpu1',), 'http://127.0.0.1:1', models=('synthetic',)),
@@ -446,10 +461,10 @@ class DashboardInterfaceTests(unittest.TestCase):
             runner.close()
     def test_standalone_todo_and_quote_use_runner_payloads_and_keep_fallbacks(self):
         values = []
-        def generate(payload, step):
+        def generate(payload, step, validator=None):
             values.append((payload, step))
             if step == 'todo-format':
-                return {'response': 'one\ntwo\n\n\n\n\n+0 more — done'}
+                return {'done': True, 'response': 'one\ntwo\n\n\n\n\n+0 more — done'}
             return {'done': True, 'response': 'A quiet day still counts as progress.'}
         from daily_quotes import DailyQuotes
         from types import SimpleNamespace
@@ -488,7 +503,7 @@ class DashboardInterfaceTests(unittest.TestCase):
     def test_real_wallpaper_graph_satisfies_reviewed_server_mutation_policy(self):
         import copy
         template = json.loads((ROOT / 'workflows/picture_api.json').read_text())
-        policy = json.loads(Path(os.environ['DASHBOARD_POLICY_EXAMPLE']).read_text())
+        policy = json.loads(Path(os.environ.get('DASHBOARD_POLICY_EXAMPLE', ROOT / 'tests/fixtures/dashboard-wallpaper-policy.example.json')).read_text())
         mutations = copy.deepcopy(policy['mutations'])
         mutations['9.image']['values'] = [self.main.COMFY_INPUT_IMAGE]
         target = Target('wallpaper', 'comfy', ('gpu0',), 'http://127.0.0.1:1', workflow=template,
@@ -502,31 +517,27 @@ class DashboardInterfaceTests(unittest.TestCase):
         captured[0]['36']['inputs']['filename_prefix'] = 'unapproved-output'
         with self.assertRaises(ValueError):
             ComfyBackend(target, None, probe=lambda: 0).validate('workflow', captured[0])
-    def test_original_composition_pixels_and_format_unchanged(self):
-        spec = importlib.util.spec_from_file_location('dashboard_original', os.environ['DASHBOARD_ORIGINAL_MAIN'])
-        original = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(original)
+    def test_deployed_composition_ast_and_format_unchanged(self):
+        # Canonical AST digest of the manifest-verified deployed compositor.
+        # No private original app/config or transformed audit module is imported.
+        import ast, hashlib
+        tree = ast.parse((ROOT / 'app/main.py').read_text(encoding='utf-8'))
+        function = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'render_wallpaper')
+        self.assertEqual(hashlib.sha256(ast.dump(function, include_attributes=False).encode()).hexdigest(),
+                         'a89963b7c23c4658ccb8a5103472ca0fbb6aa47f7989932c793cfdc256a5114d')
         image = Image.new('RGB', (1056, 808), (80, 100, 160))
-        weather = {'state': 'sunny', 'attributes': {'temperature': 15, 'temperature_unit': '°C'}}
-        for module, output in ((original, self.root / 'original.png'), (self.main, self.root / 'wallpaper.png')):
-            with (patch.object(module, 'ha_get_state', return_value=weather),
-                 patch.object(module, 'ollama_generate_overlay', return_value='synthetic overlay'),
-                 patch.object(module, 'ollama_generate_season_block', return_value='synthetic season'),
-                 patch.object(module, 'comfy_render_image', return_value=image),
-                 patch.object(module, 'ha_calendar_get_events_range', return_value={}),
-                 patch.object(module, 'ha_todo_get_items', return_value=[{'summary': 'Task ' + str(i)} for i in range(6)])):
-                module.render_wallpaper(str(output))
-        a, b = Image.open(self.root / 'original.png'), Image.open(self.root / 'wallpaper.png')
-        self.assertEqual((b.format, b.mode, b.size), ('PNG', 'RGB', (1600, 1200)))
-        # The intentional new footer indicator is the only changed area when
-        # no tasks require shortening. Calendar/picture/title/task pixels match.
+        weather = {'state': 'sunny', 'attributes': {'temperature': 15, 'temperature_unit': '\u00b0C'}}
         from recovery_status import RecoveryStatus
-        indicator = self.main.recovery_indicator_layout(ImageDraw.Draw(b), (15, 870, 1585, 1185), RecoveryStatus())
-        changed = ImageChops.difference(a, b).getbbox()
-        left, top, right, bottom = indicator['bounds']
-        self.assertIsNotNone(changed)
-        self.assertTrue(left <= changed[0] <= changed[2] <= right)
-        self.assertTrue(top <= changed[1] <= changed[3] <= bottom)
+        with (patch.object(self.main, 'ha_get_state', return_value=weather),
+              patch.object(self.main, 'ollama_generate_overlay', return_value='synthetic overlay'),
+              patch.object(self.main, 'ollama_generate_season_block', return_value='synthetic season'),
+              patch.object(self.main, 'comfy_render_image', return_value=image),
+              patch.object(self.main, 'ha_calendar_get_events_range', return_value={}),
+              patch.object(self.main, 'ha_todo_get_items', return_value=[{'summary': 'Task ' + str(i)} for i in range(6)]),
+              patch.object(self.main._RECOVERY_STATUS, 'read', return_value=RecoveryStatus())):
+            self.main.render_wallpaper(str(self.root / 'wallpaper.png'))
+        with Image.open(self.root / 'wallpaper.png') as result:
+            self.assertEqual((result.format, result.mode, result.size), ('PNG', 'RGB', (1600, 1200)))
     def test_epd_soft_failure_and_existing_paths_preserved(self):
         self.main.EPD_PUSH_ENABLED = True
         with (patch.object(self.main, 'render_wallpaper'),

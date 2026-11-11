@@ -20,7 +20,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'app'))
 from daily_quotes import DailyQuotes, toronto_day
 from aihub_gpu_runner.core import AtomicStore
-from pipeline_status import stage_event, failure_reason
+from pipeline_status import stage_event, failure_reason, runner_error_code
+from standalone_text import InvalidModelOutput
+from fastapi import HTTPException
 from aihub_gpu_runner.client import KnownJobFailure
 
 
@@ -32,7 +34,7 @@ def text_functions():
     names = {
         '_norm_ws', 'is_effectively_blank_line', '_stable_todo_hash',
         'clean_quote_text', 'quote_is_usable', 'ollama_daily_quote', 'todo_display_rows',
-        'ollama_format_todo', 'todo_ai_refresh', 'ollama_generate_overlay',
+        'ollama_format_todo', '_todo_response_lines', 'todo_ai_refresh', '_todo_ai_refresh_body', 'ollama_generate_overlay',
         'ollama_generate_season_block', 'scrub_precip_words',
         'overlay_is_valid', 'season_is_valid',
     }
@@ -48,7 +50,8 @@ def text_functions():
         'date': date, 'hashlib': hashlib, 'json': json, 're': re, 'time': time,
         'OLLAMA_MODEL': 'qwen3.8:27b', 'OLLAMA_URL': 'http://offline.invalid',
         'TODO_ENTITY': 'todo.synthetic', 'CoordinationError': SyntheticCoordinationError,
-        'QUOTE_LOCK': threading.Lock(), 'TODO_AI_LOCK': threading.Lock(),
+        'QUOTE_LOCK': threading.Lock(), 'TODO_AI_LOCK': threading.Lock(), 'TODO_REFRESH_LOCK': threading.Lock(),
+        'InvalidModelOutput': InvalidModelOutput, 'runner_error_code': runner_error_code, 'HTTPException': HTTPException,
         'QUOTE_CACHE': {'day': None, 'quote': '', 'recent': []},
         'TODO_AI_CACHE': {'hash': None, 'day': None, 'lines': [], 'summary_line': '', 'ts': 0},
         'stage_event': stage_event, 'failure_reason': failure_reason, 'KnownJobFailure': KnownJobFailure,
@@ -93,7 +96,7 @@ class DailyTextTests(unittest.TestCase):
         self.assertEqual(payload['model'], 'qwen3.8:27b')
         self.assertNotIn('think', payload)
         self.assertNotIn('think', payload['options'])
-        self.assertIn('final_empty=False done=True length_limit=False', self.logs.getvalue())
+        self.assertEqual(self.app['runner_generate'].call_args.kwargs['validator']({'done': True, 'response': self.answer}), self.lines)
 
     def test_quote_budget_and_valid_answer_preserve_existing_daily_cache(self):
         quote = 'A quiet day still counts as progress.'
@@ -153,7 +156,7 @@ class DailyTextTests(unittest.TestCase):
             '2026-10-22 — Task A — Original detail A', 'Task B — Original detail B', 'Task C'])
         self.assertIsNone(self.app['TODO_AI_CACHE']['hash'])
         self.app['runner_generate'].assert_called_once()
-        self.assertIn('final_empty=False done=True length_limit=True', self.logs.getvalue())
+        self.assertEqual(result['reason'], 'invalid_model_output')
 
     def test_empty_quote_fallback_is_not_cached_and_next_intent_is_allowed(self):
         self.app['runner_generate'].return_value = {'done': True, 'done_reason': 'length', 'response': ''}
@@ -186,7 +189,7 @@ class DailyTextTests(unittest.TestCase):
         self.app['runner_generate'].side_effect = RuntimeError('synthetic-private-error-payload')
         self.app['ollama_format_todo'](self.items)
         logs = self.logs.getvalue()
-        self.assertIn('final_empty=True done=True length_limit=True thinking_present=True', logs)
+        self.assertIn('todo formatting failed; using Home Assistant tasks (InvalidModelOutput)', logs)
         for private in (secret, 'Original detail A', 'Task A', 'synthetic-private-error-payload'):
             self.assertNotIn(private, logs)
 

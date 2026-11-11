@@ -19,6 +19,9 @@ WORKDIR /app
 COPY app/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
+COPY compatibility/client-sdk/ /opt/aihub-client-sdk/
+RUN pip install --no-cache-dir /opt/aihub-client-sdk
+
 COPY app/ /app/
 
-CMD ["python", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8787"]
+CMD ["python", "-m", "uvicorn", "recovery_media:app", "--host", "0.0.0.0", "--port", "8787"]

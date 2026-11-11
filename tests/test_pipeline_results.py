@@ -118,7 +118,10 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn('PRIVATE', json.dumps(record['response']) + json.dumps(status))
         self.main._OUTPUT_SLOT = None
         repeated = self.main.render_async(BackgroundTasks(), 'pipeline')
-        self.assertEqual(repeated, record['response'])
+        self.assertEqual({key: repeated[key] for key in record['response'] if key != 'status'},
+                         {key: value for key, value in record['response'].items() if key != 'status'})
+        self.assertEqual({key: repeated[key] for key in ('status', 'cached', 'queued', 'request_id')},
+                         {'status': 'completed', 'cached': True, 'queued': False, 'request_id': 'pipeline'})
         self.wallpaper.assert_called_once(); self.push.assert_called_once()
 
     def test_delivery_hard_failure_and_binary_failure_have_separate_stages(self):
