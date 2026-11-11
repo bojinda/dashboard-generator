@@ -20,7 +20,15 @@ def failure_reason(exc, default='service_unavailable'):
     return default
 
 
-def stage_event(name, status, reason=None, exc=None):
+def runner_error_code(exc):
+    if isinstance(exc, KnownJobFailure):
+        for code in CODES:
+            if str(exc) == 'runner_job_failed_' + code:
+                return code
+    return None
+
+
+def stage_event(name, status, reason=None, exc=None, error_code=None):
     operation = CURRENT_OPERATION.get()
     if operation is None: return
     if name not in STAGES or status not in STATES: raise ValueError('invalid_pipeline_stage')
@@ -28,9 +36,8 @@ def stage_event(name, status, reason=None, exc=None):
     stages = dict(pipeline.get('stages', {}))
     value = {'status': status}
     if reason in REASONS: value['reason'] = reason
-    if isinstance(exc, KnownJobFailure):
-        for code in CODES:
-            if str(exc) == 'runner_job_failed_' + code: value['runner_error_code'] = code
+    code = runner_error_code(exc) or error_code
+    if code in CODES: value['runner_error_code'] = code
     if isinstance(exc, PendingJob):
         import re
         if re.fullmatch(r'stage-[0-9a-f]{48}', exc.request_id): value['runner_request_id'] = exc.request_id

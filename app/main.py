@@ -25,9 +25,11 @@ from recovery_status import RecoveryStatusReader, environment_transport
 from recovery_ack import RecoveryAcknowledgment
 import hmac
 from daily_quotes import DailyQuotes, toronto_day
-from pipeline_status import stage_event, pipeline_summary, abort_pipeline, failure_reason, delivery_reason
+from pipeline_status import stage_event, pipeline_summary, abort_pipeline, failure_reason, delivery_reason, runner_error_code
+from standalone_text import InvalidModelOutput
 from aihub_gpu_runner.client import KnownJobFailure
-from aihub_gpu_runner.client import CURRENT_OPERATION, CoordinationError, OutputBusy, OutputSlot
+from aihub_gpu_runner.client import CURRENT_OPERATION, CoordinationError, OutputBusy
+from media_dispatch import DispatchOutputSlot as OutputSlot, DispatchBlocked, public_operation
 
 
 from prompts import (
@@ -356,6 +358,20 @@ def todo_display_rows(lines):
     return rows, quote_idx
 
 
+def _todo_response_lines(data, tasks):
+    if not isinstance(data, dict) or not isinstance(data.get("response"), str):
+        raise InvalidModelOutput("invalid_todo_response_shape")
+    out = (data.get("response") or "").strip()
+    if data.get("done") is not True or data.get("done_reason") == "length":
+        raise InvalidModelOutput("incomplete_todo_generation")
+    lines = [ln.rstrip() for ln in out.splitlines()]
+    if not out or (tasks and not any(
+            not is_effectively_blank_line(ln) and
+            not (ln.lstrip().startswith("+") and "more" in ln.lower()) for ln in lines[:6])):
+        raise InvalidModelOutput("empty_final_task_response")
+    return lines
+
+
 def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
     stage_event('todo', 'running')
     tasks = []
@@ -378,23 +394,15 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
     }
 
     try:
-        data = runner_generate(payload, "todo-format")
-        out = (data.get("response") or "").strip()
-        print(f"todo-format: final_empty={not bool(out)} done={data.get('done') is True} "
-              f"length_limit={data.get('done_reason') == 'length'} "
-              f"thinking_present={bool(data.get('thinking'))}", flush=True)
-        if data.get("done") is not True or data.get("done_reason") == "length":
-            raise ValueError("incomplete_todo_generation")
-        lines = [ln.rstrip() for ln in out.splitlines()]
-        if not out or (tasks and not any(
-                not is_effectively_blank_line(ln) and
-                not (ln.lstrip().startswith("+") and "more" in ln.lower()) for ln in lines[:6])):
-            raise ValueError("empty_final_task_response")
+        data = runner_generate(payload, "todo-format", validator=lambda value: _todo_response_lines(value, tasks))
+        lines = _todo_response_lines(data, tasks)
     except CoordinationError as exc:
         stage_event('todo', 'uncertain', 'runner_uncertain', exc)
         raise
     except Exception as e:
-        stage_event('todo', 'fallback', failure_reason(e, 'invalid_model_output'), e)
+        reason = failure_reason(e, 'invalid_model_output' if isinstance(e, InvalidModelOutput) else 'service_unavailable')
+        code = runner_error_code(e)
+        stage_event('todo', 'fallback', reason, e)
         print(f"todo formatting failed; using Home Assistant tasks ({type(e).__name__})", flush=True)
         raw_lines = []
         for t in tasks[:6]:
@@ -406,7 +414,8 @@ def ollama_format_todo(items_open_sorted: list[dict]) -> dict:
             raw_lines.append(line)
         while len(raw_lines) < 6:
             raw_lines.append("")
-        return {"lines": raw_lines[:6], "summary_line": "+0 more — fallback mode", "fallback": True}
+        return {"lines": raw_lines[:6], "summary_line": "+0 more — fallback mode", "fallback": True,
+                "reason": reason, "runner_error_code": code}
 
     if len(lines) < 7:
         lines = lines + [""] * (7 - len(lines))
@@ -1405,10 +1414,14 @@ def render_wallpaper(path: str):
         ai_lines = list(TODO_AI_CACHE.get("lines") or []) if TODO_AI_CACHE.get("day") == toronto_day() else []
         ai_summary = (TODO_AI_CACHE.get("summary_line") or "").strip()
         quote_idx = TODO_AI_CACHE.get("quote_idx")
+        todo_reason = TODO_AI_CACHE.get("reason")
+        todo_error_code = TODO_AI_CACHE.get("runner_error_code")
+        todo_cached = bool(TODO_AI_CACHE.get("hash"))
 
     if ai_lines:
-        stage_event('todo', 'cached' if TODO_AI_CACHE.get('hash') else 'fallback',
-                    None if TODO_AI_CACHE.get('hash') else 'invalid_model_output')
+        stage_event('todo', 'cached' if todo_cached else 'fallback',
+                    None if todo_cached else (todo_reason or 'service_unavailable'),
+                    error_code=todo_error_code)
     # Quote appears on visible line 5 (idx 4) only when we inserted it:
     # buffer line (idx 3) blank + idx 4 non-empty
         ai_lines, quote_idx = todo_display_rows(ai_lines)
@@ -1501,8 +1514,12 @@ def _reserve_output(kind, request_id=None):
     with JOB_LOCK:
         try:
             operation = _output_slot().begin(kind, request_id if isinstance(request_id, str) else None)
-        except OutputBusy:
-            return None
+        except OutputBusy as exc:
+            reason = exc.reason if isinstance(exc, DispatchBlocked) else "output_operation_busy"
+            raise HTTPException(status_code=409 if reason == "output_operation_busy" else 503,
+                detail={"status": "busy" if reason == "output_operation_busy" else "unable_to_submit",
+                        "queued": False, "reason": reason,
+                        "operator_required": getattr(exc, "operator_required", False)}) from None
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid X-Request-ID")
         except CoordinationError as exc:
@@ -1547,8 +1564,20 @@ def _run_render_job(operation):
         CURRENT_OPERATION.reset(token)
 
 # -------- API --------
+TODO_REFRESH_LOCK = threading.Lock()
+
+
 @app.post("/todo_ai_refresh")
 def todo_ai_refresh():
+    if not TODO_REFRESH_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail='todo_refresh_in_progress')
+    try:
+        return _todo_ai_refresh_body()
+    finally:
+        TODO_REFRESH_LOCK.release()
+
+
+def _todo_ai_refresh_body():
     items_open = _todo_items_open_sorted(TODO_ENTITY)
     h = _stable_todo_hash(items_open)
 
@@ -1594,6 +1623,8 @@ def todo_ai_refresh():
         TODO_AI_CACHE["summary_line"] = lines[6]
         TODO_AI_CACHE["ts"] = int(time.time())
         TODO_AI_CACHE["day"] = today
+        TODO_AI_CACHE["reason"] = formatted.get("reason")
+        TODO_AI_CACHE["runner_error_code"] = formatted.get("runner_error_code")
 
     lines[:6], _ = todo_display_rows(lines[:6])
     return {
@@ -1602,6 +1633,9 @@ def todo_ai_refresh():
         "hash": h,
         "lines": lines[:6],
         "summary": lines[6],
+        "fallback": bool(formatted.get("fallback")),
+        "reason": formatted.get("reason"),
+        "runner_error_code": formatted.get("runner_error_code"),
     }
 
 @app.post("/render_test")
@@ -1669,13 +1703,16 @@ def render_async(background_tasks: BackgroundTasks, request_id: str | None = Hea
     if operation is None:
         return {"ok": True, "queued": False, "status": "busy"}
     if operation.cached:
-        return operation.record["response"]
+        return dict(operation.record["response"], cached=True, queued=False,
+                    request_id=operation.request_id, status="completed",
+                    status_url="/render_status?request_id=" + operation.request_id)
     try:
         background_tasks.add_task(_run_render_job, operation)
     except Exception as exc:
         _finish_output(operation, error=exc)
         raise
-    return {"ok": True, "queued": True, "request_id": operation.request_id}
+    return {"ok": True, "queued": True, "status": "queued", "cached": False,
+            "request_id": operation.request_id, "status_url": "/render_status?request_id=" + operation.request_id}
 
 
 @app.post("/render_test_path")
@@ -1718,7 +1755,18 @@ def render_status(request_id: str | None = None):
         if record is None:
             raise HTTPException(status_code=404, detail='operation_not_found')
         last = _operation_status(record)
-        return {"ok": True, "running": last["status"] == "running", "last": last}
+        status = public_operation(record)
+        return {"ok": status != "failed", "running": status == "running", "status": status,
+                "request_id": record.get("request_id"), "last": last,
+                "succeeded": status == "completed", "fully_successful": bool(last.get("fully_successful", status == "completed")),
+                "dispatch": _output_slot().health(refresh=True)}
+
+
+def dispatch_status():
+    try:
+        return _output_slot().health(refresh=True)
+    except Exception:
+        return {"dispatch_status": "unavailable", "reason": "reconciliation_storage_unavailable", "operator_required": True}
 
 @app.post("/render")
 def render(request_id: str | None = Header(None, alias="X-Request-ID")):

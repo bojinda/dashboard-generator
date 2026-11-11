@@ -18,8 +18,15 @@ def _run(step, target, operation, payload, artifact=False):
     return JobClient.from_environment().run(request_id, target, operation, payload, artifact=artifact)
 
 
-def generate(payload, step):
-    return _run(step, os.environ.get('GPU_RUNNER_OLLAMA_TARGET', 'ollama'), 'generate', payload)
+def generate(payload, step, validator=None):
+    target = os.environ.get('GPU_RUNNER_OLLAMA_TARGET', 'ollama')
+    if CURRENT_OPERATION.get() is None:
+        from standalone_text import generate_standalone
+        return generate_standalone(payload, step, target, validator)
+    data = _run(step, target, 'generate', payload)
+    if validator is not None:
+        validator(data)
+    return data
 
 
 def wallpaper(workflow):
