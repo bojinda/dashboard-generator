@@ -10,6 +10,11 @@ from pathlib import Path
 from aihub_gpu_runner.client import APITransport, CoordinationError, OutputBusy, OutputSlot
 from aihub_gpu_runner.core import NativeLock, check_id, encode, strict_json, timestamp
 
+# Render admission/status callers allow 10s. Include initial/final readiness,
+# historical lookups and 404 revalidation in ONE budget, with 1s caller margin.
+RUNNER_REQUEST_TIMEOUT = 2.5
+RECONCILIATION_TIMEOUT = 9.0
+
 REASONS = {'output_operation_busy', 'runner_unavailable', 'runner_maintenance',
            'runner_owner_reconciling', 'runner_owner_unverified',
            'previous_runner_job_unresolved', 'runner_job_identity_mismatch',
@@ -72,7 +77,7 @@ class DispatchOutputSlot(OutputSlot):
         import os
         if self.transport is None:
             self.transport = APITransport(os.environ.get('GPU_RUNNER_URL', ''),
-                                          os.environ.get('GPU_RUNNER_TOKEN', ''), timeout=.6)
+                                          os.environ.get('GPU_RUNNER_TOKEN', ''), timeout=RUNNER_REQUEST_TIMEOUT)
         if self.monotonic() >= deadline:
             raise DispatchBlocked('output_reconciliation_bound_exceeded')
         try:
@@ -88,6 +93,8 @@ class DispatchOutputSlot(OutputSlot):
         except DispatchBlocked:
             raise
         except Exception:
+            if self.monotonic() >= deadline:
+                raise DispatchBlocked('output_reconciliation_bound_exceeded') from None
             raise DispatchBlocked('runner_unavailable') from None
 
     def _ready(self, deadline):
@@ -161,7 +168,7 @@ class DispatchOutputSlot(OutputSlot):
 
     def reconcile_runner_jobs(self):
         """Existing output lock is held by begin. Only bounded authenticated GETs."""
-        deadline = self.monotonic() + 3
+        deadline = self.monotonic() + RECONCILIATION_TIMEOUT
         try:
             ready = self._ready(deadline)
             current_owned_jobs = {owner['job_id'] for owner in ready['owners'].values()}
