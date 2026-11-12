@@ -148,7 +148,9 @@ class DispatchOutputSlot(OutputSlot):
                 receipt.get('runner_request_id') == job_id and receipt.get('runner_binding') == pending and
                 receipt.get('outcome') == outcome and receipt.get('replayed') is False and
                 isinstance(receipt.get('reconciled_at'), str) and isinstance(receipt.get('proof'), dict))
-            proof = receipt.get('proof', {}) if isinstance(receipt, dict) else {}
+            if not valid:
+                raise DispatchBlocked('runner_job_identity_mismatch', operator_required=True)
+            proof = receipt['proof']
             if outcome == 'terminal_released':
                 valid = valid and (proof.get('request_id') == job_id and
                     proof.get('request_hash') == pending['request_hash'] and proof.get('target') == pending['target'] and
@@ -157,6 +159,14 @@ class DispatchOutputSlot(OutputSlot):
             else:
                 ended = record.get('finished') or record.get('started')
                 owners = proof.get('unrelated_owners')
+                if 'owners' in proof:
+                    # Confirmed historical spelling, with an empty map only.
+                    # Never fall back over an invalid/conflicting current key.
+                    legacy = proof['owners']
+                    valid = valid and isinstance(legacy, dict) and not legacy and (
+                        'unrelated_owners' not in proof or owners == legacy)
+                    if 'unrelated_owners' not in proof:
+                        owners = legacy
                 valid = valid and (proof.get('exact_request_absent_twice') is True and
                     proof.get('runner_ready') is True and proof.get('minimum_completed_client_age_seconds') == 60 and
                     type(ended) in (int, float) and self.clock() - ended >= 60 and isinstance(owners, dict) and

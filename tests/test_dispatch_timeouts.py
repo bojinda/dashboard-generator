@@ -55,7 +55,7 @@ class DelayedRunner:
         self.stop.set();self.server.shutdown();self.thread.join(3);self.server.server_close()
 
 
-def history(slot,http,operations=394,references=313):
+def history(slot,http,operations=394,references=313,legacy_absence=False):
     """Same counts/proof classes as the observed inventory; generic identities."""
     records={};now=time.time()-120
     for number in range(operations):
@@ -73,20 +73,21 @@ def history(slot,http,operations=394,references=313):
         if number<5:
             slot._receipt(record,jid,pending,'terminal_released',status)
         if number==5:
-            slot._receipt(record,jid,pending,'not_submitted',dict(exact_request_absent_twice=True,
-                runner_ready=True,unrelated_owners={},minimum_completed_client_age_seconds=60))
+            proof=dict(exact_request_absent_twice=True,runner_ready=True,minimum_completed_client_age_seconds=60)
+            proof['owners' if legacy_absence else 'unrelated_owners']={}
+            slot._receipt(record,jid,pending,'not_submitted',proof)
     slot.store.write('active.json',records['operation-0006'])
     with NativeLock(slot.lock_path).held():pass
     return {p:p.read_bytes() for p in slot.store.path('operations').glob('*.json')}
 
 
 @contextlib.contextmanager
-def fixture(http,operations=394,references=313):
+def fixture(http,operations=394,references=313,legacy_absence=False):
     with tempfile.TemporaryDirectory(prefix='dispatch-timeout-') as directory,patch.dict(os.environ,
             GPU_RUNNER_URL=http.url,GPU_RUNNER_TOKEN=TOKEN):
         root=Path(directory)
         slot=dispatch.DispatchOutputSlot(root/'state',[root/'wallpaper.png',root/'image_data.bin'])
-        originals=history(slot,http,operations,references)
+        originals=history(slot,http,operations,references,legacy_absence)
         yield slot,originals
 
 
@@ -96,7 +97,7 @@ class DispatchTimeoutTests(unittest.TestCase):
         import uvicorn
         app_fixture=existing.ASGITests('run');app_fixture.setUp()
         self.addCleanup(app_fixture.tearDown)
-        with DelayedRunner() as http,fixture(http) as (slot,originals):
+        with DelayedRunner() as http,fixture(http,legacy_absence=True) as (slot,originals):
             app_fixture.main._OUTPUT_SLOT=slot
             sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1]
             server=uvicorn.Server(uvicorn.Config(app_fixture.app,log_level='critical',access_log=False))

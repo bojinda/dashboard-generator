@@ -30,6 +30,16 @@ Positive receipts permit bounded progress on a later pass. The eight-query cap
 is unchanged. Total-budget exhaustion reports `output_reconciliation_bound_exceeded`;
 a request failure before that deadline still reports `runner_unavailable`.
 
+Historical absence receipts may spell the empty owner map `owners: {}`. The
+reader accepts that confirmed shape as well as the current `unrelated_owners`
+format. It does not rewrite either format. A nonempty legacy map, invalid type,
+missing predicate, mismatched identity/hash, or conflicting pair of keys is
+rejected; both keys are accepted together only when both are empty maps. Current
+nonempty `unrelated_owners` proofs retain their existing validation. A historical
+absence receipt still triggers fresh double-404/readiness/age/ownership checks
+on every pass; it is never an immutable native settlement. A later submitted job
+is checked normally, and active ownership still blocks new admission.
+
 Nine seconds cannot accommodate every possible chain of valid slow replies.
 For example, even a single 404 path needs five GETs, so five two-second replies
 cannot fit beneath the ten-second caller plus response margin. Such a pass must
@@ -46,6 +56,9 @@ dispatch-progress tests retain the 5,000-plus records, tampering, ownership and
 synthetic and no inference is run. Run `python -m unittest discover -s tests` in
 the dependency-correct environment; use `tests.test_dispatch_timeouts` for the
 focused cases when the repository root and tests helpers are importable.
+`tests/test_legacy_receipts.py` covers both proof shapes, conflicts, malformed
+proofs, required fields, active owners, later job appearance and no replay. The
+394-operation real-HTTP ASGI case uses the legacy empty-map receipt shape.
 
 Deploy only the Git blob for this one app file after separate approval. Back up
 its original bytes/metadata and preserve receipts, caches, pending intents and
