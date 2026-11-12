@@ -32,8 +32,8 @@ def create_router(settings):
 
     @router.api_route('/{action}',methods=['GET','POST'])
     async def route(action:str,request:Request):
-        write=action in ('recover','emergency','verify')
-        if action not in ('status','check','check-emergency','recover','emergency','verify') or request.method!=('POST' if write else 'GET'):
+        write=action in ('recover','emergency','verify','estop','estop-verify')
+        if action not in ('status','check','check-emergency','recover','emergency','verify','estop-status','estop-check','estop','estop-verify') or request.method!=('POST' if write else 'GET'):
             return JSONResponse({'error':'unsupported_recovery_action'},404)
         auth=request.headers.get('authorization','')
         token=tokens['ha_operate' if write else 'ha_read']
