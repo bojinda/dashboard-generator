@@ -32,8 +32,8 @@ def create_router(settings):
 
     @router.api_route('/{action}',methods=['GET','POST'])
     async def route(action:str,request:Request):
-        write=action in ('recover','emergency','verify','estop','estop-verify')
-        if action not in ('status','check','check-emergency','recover','emergency','verify','estop-status','estop-check','estop','estop-verify') or request.method!=('POST' if write else 'GET'):
+        write=action in ('recover','emergency','verify','estop')
+        if action not in ('status','check','check-emergency','recover','emergency','verify','estop-status','estop') or request.method!=('POST' if write else 'GET'):
             return JSONResponse({'error':'unsupported_recovery_action'},404)
         auth=request.headers.get('authorization','')
         token=tokens['ha_operate' if write else 'ha_read']
@@ -66,6 +66,8 @@ def create_router(settings):
             from starlette.concurrency import run_in_threadpool
             return await run_in_threadpool(forward)
         except Exception:
+            if action=='estop':
+                return JSONResponse({'outcome':'unknown','error':'runner_response_unavailable_no_retry'},503)
             return JSONResponse({'error':'runner_response_unavailable','verify_required':write,
                 'message':'Read status, then verify the recorded operation. Do not repeat the confirmed request.'},503)
     return router
